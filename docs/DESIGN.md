@@ -1,6 +1,6 @@
 # RustyGestures: requirements, features and design
 
-*Rev 3, 2026-11-09. Author: PLN. Repo (planned, not yet created): `github.com/PLN/RustyGestures`. Status: proposal, not started.*
+*Rev 3.1, 2026-11-09. Author: PLN. Repo: `github.com/PLN/RustyGestures`. Status: M0 spike in progress.*
 
 RustyGestures is a lean, open-source mouse-gesture utility for Windows, written in Rust and released under the MIT license.
 

@@ -20,6 +20,16 @@ pub struct RunStats {
     pub trail_active: bool,
 }
 
+/// Options for one capture session.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RunOptions {
+    /// Sleep this long on the hook thread once a stroke starts, without
+    /// refreshing the heartbeat, so the stall watchdog can be observed.
+    pub debug_stall_ms: u32,
+    /// When non-zero, send random mouse input for this many seconds and then stop.
+    pub fuzz_seconds: u64,
+}
+
 /// Failure while installing the hook or the overlay.
 #[derive(Debug)]
 pub struct SessionError(pub String);
@@ -35,17 +45,17 @@ impl std::error::Error for SessionError {}
 /// Run the hook until `on_stroke` returns [`Control::Stop`] or the console asks
 /// to quit. `on_stroke` runs on the thread that owns the overlay, never inside
 /// the hook callback.
-pub fn run_session<F>(on_stroke: F) -> Result<RunStats, SessionError>
+pub fn run_session<F>(options: RunOptions, on_stroke: F) -> Result<RunStats, SessionError>
 where
     F: FnMut(&Stroke) -> Control,
 {
     #[cfg(windows)]
     {
-        platform::run(on_stroke)
+        platform::run(options, on_stroke)
     }
     #[cfg(not(windows))]
     {
-        let _ = on_stroke;
+        let _ = (options, on_stroke);
         Err(SessionError(
             "capture requires Windows (WH_MOUSE_LL)".to_owned(),
         ))

@@ -4,6 +4,7 @@
 use proptest::prelude::*;
 use rustygestures_core::{
     Button, Command, Config, Decision, EventKind, InputEvent, Machine, Neutralize, Output, Phase,
+    RecoverKind,
 };
 
 #[derive(Clone, Debug)]
@@ -20,6 +21,8 @@ enum Step {
     PollTimeout {
         dt: u16,
     },
+    /// The primary release never reached the hook.
+    LostRelease,
     Neutralize,
 }
 
@@ -53,6 +56,7 @@ fn step_strategy() -> impl Strategy<Value = Step> {
                 touch_or_pen,
             }),
         2 => (0u16..700).prop_map(|dt| Step::PollTimeout { dt }),
+        1 => Just(Step::LostRelease),
         1 => Just(Step::Neutralize),
     ]
 }
@@ -68,9 +72,18 @@ fn apply_output(books: &mut Books, ev: &InputEvent, output: &Output) {
     let deferred = output.replay.is_some();
     let real_swallow = output.decision == Decision::Swallow && !deferred;
     if real_swallow && ev.kind == EventKind::Press && ev.button == primary {
+        if books.open_swallows > 0 {
+            // A new primary press while one was already swallowed means the
+            // release was lost. The old press was not delivered.
+            books.open_swallows = 0;
+        }
         books.open_swallows += 1;
     }
-    if real_swallow && ev.kind == EventKind::Release && ev.button == primary {
+    if real_swallow
+        && ev.kind == EventKind::Release
+        && ev.button == primary
+        && books.open_swallows > 0
+    {
         books.open_swallows -= 1;
     }
     match output.command {
@@ -96,14 +109,30 @@ fn apply_output(books: &mut Books, ev: &InputEvent, output: &Output) {
     }
 }
 
+fn dummy_event(time_ms: u32) -> InputEvent {
+    InputEvent {
+        kind: EventKind::Move,
+        button: Button::Right,
+        x: 0,
+        y: 0,
+        time_ms,
+        injected: false,
+        touch_or_pen: false,
+    }
+}
+
 fn apply_neutralize(books: &mut Books, action: Neutralize) {
     match action {
         Neutralize::None => {}
-        Neutralize::SyntheticClick { .. } => {
-            books.open_swallows -= 1;
+        Neutralize::SyntheticClick { .. } | Neutralize::Drop => {
+            books.open_swallows = 0;
             books.target_down = false;
         }
-        Neutralize::SyntheticRelease { .. } => {
+        Neutralize::DeliverPress { .. } => {
+            books.open_swallows = 0;
+            books.target_down = true;
+        }
+        Neutralize::DeliverRelease { .. } => {
             books.target_down = false;
         }
     }
@@ -122,7 +151,15 @@ fn check(machine: &Machine, books: &Books) {
         machine.phase(),
         books.open_swallows
     );
-    assert_eq!(books.target_down, machine.delivered_down());
+    assert_eq!(
+        books.target_down,
+        machine.delivered_down(),
+        "phase {:?} open {} target {} delivered {}",
+        machine.phase(),
+        books.open_swallows,
+        books.target_down,
+        machine.delivered_down()
+    );
     assert!(!(books.target_down && books.open_swallows > 0));
 }
 
@@ -158,30 +195,24 @@ proptest! {
                 }
                 Step::PollTimeout { dt } => {
                     time_ms = time_ms.wrapping_add(u32::from(dt));
-                    let command = machine.poll_timeout(time_ms);
-                    if command != Command::None {
-                        let ev = InputEvent {
-                            kind: EventKind::Move,
-                            button: Button::Right,
-                            x,
-                            y,
-                            time_ms,
-                            injected: false,
-                            touch_or_pen: false,
-                        };
-                        apply_output(
-                            &mut books,
-                            &ev,
-                            &Output {
-                                decision: Decision::Pass,
-                                command,
-                                replay: None,
-                            },
-                        );
+                    let output = machine.poll_timeout(time_ms, true);
+                    if output.command != Command::None {
+                        apply_output(&mut books, &dummy_event(time_ms), &output);
                     }
                 }
+                Step::LostRelease => {
+                    let action = match machine.phase() {
+                        Phase::Capturing => machine.recover(RecoverKind::Inactivity, false),
+                        Phase::Pending => machine.recover(RecoverKind::Watchdog, false),
+                        Phase::Idle if machine.delivered_down() => {
+                            machine.recover(RecoverKind::Session, false)
+                        }
+                        Phase::Idle => Neutralize::None,
+                    };
+                    apply_neutralize(&mut books, action);
+                }
                 Step::Neutralize => {
-                    let action = machine.neutralize();
+                    let action = machine.recover(RecoverKind::Watchdog, true);
                     apply_neutralize(&mut books, action);
                 }
             }
@@ -189,26 +220,12 @@ proptest! {
         }
 
         time_ms = time_ms.wrapping_add(10_000);
-        let command = machine.poll_timeout(time_ms);
-        if command != Command::None {
-            apply_output(
-                &mut books,
-                &InputEvent {
-                    kind: EventKind::Move,
-                    button: Button::Right,
-                    x,
-                    y,
-                    time_ms,
-                    injected: false,
-                    touch_or_pen: false,
-                },
-                &Output {
-                    decision: Decision::Pass,
-                    command,
-                    replay: None,
-                },
-            );
+        let output = machine.poll_timeout(time_ms, true);
+        if output.command != Command::None {
+            apply_output(&mut books, &dummy_event(time_ms), &output);
         }
+        let inactive = machine.poll_inactivity(time_ms);
+        apply_neutralize(&mut books, inactive);
         if machine.phase() != Phase::Idle {
             let ev = InputEvent {
                 kind: EventKind::Release,
@@ -235,7 +252,7 @@ proptest! {
             let output = machine.handle(ev);
             apply_output(&mut books, &ev, &output);
         }
-        let action = machine.neutralize();
+        let action = machine.recover(RecoverKind::Shutdown, false);
         apply_neutralize(&mut books, action);
         check(&machine, &books);
         prop_assert_eq!(machine.phase(), Phase::Idle);

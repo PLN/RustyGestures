@@ -9,7 +9,7 @@ use rustygestures_core::{
     StrokeLog, GESTURE_SCHEMA,
 };
 use rustygestures_ui::is_implemented;
-use rustygestures_win::{run_session, Control};
+use rustygestures_win::{run_session, Control, RunOptions};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -21,6 +21,11 @@ struct Cli {
     /// Gesture template file.
     #[arg(long, global = true, default_value = "gestures.json")]
     gestures: PathBuf,
+
+    /// Once a stroke starts, pause the hook thread for this many milliseconds
+    /// without refreshing its heartbeat, so the stall watchdog can be checked.
+    #[arg(long, global = true, default_value_t = 0)]
+    debug_stall_ms: u32,
 
     #[command(subcommand)]
     command: Commands,
@@ -46,6 +51,12 @@ enum Commands {
     List,
     /// Run the hook and print the callback latency histogram on exit.
     Latency,
+    /// Send random mouse input for N seconds while the hook is installed.
+    Fuzz {
+        /// How long to run. The M0 soak is 3600.
+        #[arg(long, default_value_t = 3600)]
+        seconds: u64,
+    },
 }
 
 fn main() -> ExitCode {
@@ -62,15 +73,23 @@ fn try_main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     // Referenced so the placeholder crate stays in the build.
     let _ui = is_implemented();
-    match cli.command {
+    match &cli.command {
         Commands::List => {
             list(&cli.gestures)?;
             Ok(ExitCode::SUCCESS)
         }
-        Commands::Run => run_recognize(&cli.gestures),
-        Commands::Train { name, count } => train(&cli.gestures, &name, count),
-        Commands::Record { output } => record(&output),
-        Commands::Latency => run_recognize(&cli.gestures),
+        Commands::Run => run_recognize(&cli),
+        Commands::Train { name, count } => train(&cli, name, *count),
+        Commands::Record { output } => record(&cli, output),
+        Commands::Latency => run_recognize(&cli),
+        Commands::Fuzz { seconds } => fuzz(&cli, *seconds),
+    }
+}
+
+fn options_of(cli: &Cli, fuzz_seconds: u64) -> RunOptions {
+    RunOptions {
+        debug_stall_ms: cli.debug_stall_ms,
+        fuzz_seconds,
     }
 }
 
@@ -86,13 +105,10 @@ fn list(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn run_recognize(path: &std::path::Path) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    let set = load_gesture_file(path)?.to_set();
-    println!(
-        "hook installed (right button, 10 px, 500 ms cancel). Ctrl+C to exit. templates={}",
-        set.len()
-    );
-    let stats = run_session(|stroke| {
+fn run_recognize(cli: &Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let set = load_gesture_file(&cli.gestures)?.to_set();
+    println!("templates={}", set.len());
+    let stats = run_session(options_of(cli, 0), |stroke| {
         match set.recognize(stroke.as_slice()) {
             Some(found) => {
                 println!(
@@ -111,22 +127,18 @@ fn run_recognize(path: &std::path::Path) -> Result<ExitCode, Box<dyn std::error:
     Ok(ExitCode::SUCCESS)
 }
 
-fn train(
-    path: &std::path::Path,
-    name: &str,
-    count: usize,
-) -> Result<ExitCode, Box<dyn std::error::Error>> {
+fn train(cli: &Cli, name: &str, count: usize) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let gesture_name = GestureName::parse(name)?;
     if count == 0 {
         return Err("train count must be at least 1".into());
     }
-    let mut file = load_gesture_file(path)?;
+    let mut file = load_gesture_file(&cli.gestures)?;
     println!(
-        "draw {count} stroke(s) for '{}' with the right button. Ctrl+C cancels.",
+        "draw {count} stroke(s) for '{}' with the right button. Ctrl+C stops and saves the samples recorded so far.",
         gesture_name.as_str()
     );
     let mut kept = 0usize;
-    let stats = run_session(|stroke| {
+    let stats = run_session(options_of(cli, 0), |stroke| {
         kept += 1;
         file.add_sample(gesture_name.as_str(), stroke.as_slice());
         println!("saved sample {kept}/{count} ({} points)", stroke.len);
@@ -140,16 +152,16 @@ fn train(
         println!("{}", stats.latency);
         return Err("no strokes recorded".into());
     }
-    save_gesture_file(path, &file)?;
-    println!("wrote {} ({kept} new sample(s))", path.display());
+    save_gesture_file(&cli.gestures, &file)?;
+    println!("wrote {} ({kept} new sample(s))", cli.gestures.display());
     println!("{}", stats.latency);
     Ok(ExitCode::SUCCESS)
 }
 
-fn record(output: &std::path::Path) -> Result<ExitCode, Box<dyn std::error::Error>> {
+fn record(cli: &Cli, output: &std::path::Path) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let mut strokes = Vec::new();
     println!("recording strokes to {}. Ctrl+C to stop.", output.display());
-    let stats = run_session(|stroke| {
+    let stats = run_session(options_of(cli, 0), |stroke| {
         strokes.push(points_of(stroke.as_slice()));
         println!("recorded stroke {} ({} points)", strokes.len(), stroke.len);
         Control::Continue
@@ -164,6 +176,16 @@ fn record(output: &std::path::Path) -> Result<ExitCode, Box<dyn std::error::Erro
     save_stroke_log(output, &log)?;
     println!("wrote {}", output.display());
     println!("{}", stats.latency);
+    Ok(ExitCode::SUCCESS)
+}
+
+fn fuzz(cli: &Cli, seconds: u64) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    if seconds == 0 {
+        return Err("fuzz seconds must be at least 1".into());
+    }
+    let stats = run_session(options_of(cli, seconds), |_stroke| Control::Continue)?;
+    println!("{}", stats.latency);
+    println!("fuzz finished");
     Ok(ExitCode::SUCCESS)
 }
 

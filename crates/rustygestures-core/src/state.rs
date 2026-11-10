@@ -21,6 +21,13 @@ pub const DEFAULT_MIN_MOVE_PX: i32 = 10;
 /// How long a press may sit still before it is replayed so a drag still works.
 pub const DEFAULT_CANCEL_DELAY_MS: u32 = 500;
 
+/// No hook event for this long while capturing means the release was lost.
+pub const CAPTURE_INACTIVITY_MS: u32 = 2_000;
+
+/// Other-button events held back during Pending so they are injected after the
+/// primary press, preserving order.
+pub const DEFERRED_CAP: usize = 8;
+
 /// If the engine stops making progress for this long during a capture, held
 /// input is released.
 pub const WATCHDOG_STALL_MS: u32 = 250;
@@ -152,6 +159,10 @@ pub struct Output {
     pub decision: Decision,
     pub command: Command,
     pub replay: Option<Replay>,
+    /// Other-button events swallowed during Pending. Apply them after `command`
+    /// and before `replay`.
+    pub deferred: [Replay; DEFERRED_CAP],
+    pub deferred_len: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -168,22 +179,45 @@ impl Stroke {
     }
 }
 
+/// Why the engine is leaving a capture without a normal release.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoverKind {
+    /// The hook thread stopped making progress.
+    Watchdog,
+    /// Process exit. A click is used only when the physical button is already up.
+    Shutdown,
+    /// Session lock, disconnect, or switch. Do not leave the target holding a button.
+    Session,
+    /// No events while capturing.
+    Inactivity,
+    /// The output queue overflowed.
+    Overflow,
+}
+
 /// What the caller must inject so a held press is not left unpaired.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Neutralize {
     None,
-    /// A suppressed press is closed with a synthetic press and release.
+    /// The physical button is still down. Inject the press only.
+    DeliverPress {
+        button: Button,
+        x: i32,
+        y: i32,
+    },
+    /// The target has the button down and the real release will not arrive.
+    DeliverRelease {
+        button: Button,
+        x: i32,
+        y: i32,
+    },
+    /// Shutdown, and the physical button is already up. Press and release.
     SyntheticClick {
         button: Button,
         x: i32,
         y: i32,
     },
-    /// A press was already delivered. Inject the matching release.
-    SyntheticRelease {
-        button: Button,
-        x: i32,
-        y: i32,
-    },
+    /// Inject nothing. The next primary release is swallowed.
+    Drop,
 }
 
 #[derive(Clone, Debug)]
@@ -200,6 +234,10 @@ pub struct Machine {
     delivered_button: Button,
     delivered_x: i32,
     delivered_y: i32,
+    swallow_next: bool,
+    last_event_ms: u32,
+    deferred: [Replay; DEFERRED_CAP],
+    deferred_len: u8,
     stroke_ready: bool,
     last_stroke: Stroke,
 }
@@ -220,6 +258,15 @@ impl Machine {
             delivered_button: config.primary,
             delivered_x: 0,
             delivered_y: 0,
+            swallow_next: false,
+            last_event_ms: 0,
+            deferred: [Replay {
+                kind: EventKind::Move,
+                button: Button::Left,
+                x: 0,
+                y: 0,
+            }; DEFERRED_CAP],
+            deferred_len: 0,
             stroke_ready: false,
             last_stroke: Stroke {
                 points: [Point { x: 0, y: 0 }; MAX_STROKE_POINTS],
@@ -237,6 +284,15 @@ impl Machine {
     #[must_use]
     pub fn delivered_down(&self) -> bool {
         self.delivered_down
+    }
+
+    #[must_use]
+    pub fn swallow_next_release(&self) -> bool {
+        self.swallow_next
+    }
+
+    pub fn set_swallow_next_release(&mut self, value: bool) {
+        self.swallow_next = value;
     }
 
     /// Button and point the watchdog should re-inject if the engine stalls.
@@ -274,6 +330,7 @@ impl Machine {
             self.note_delivered_release(&ev);
             return pass();
         }
+        self.last_event_ms = ev.time_ms;
 
         // A move that crosses the threshold is a stroke, even if this event's
         // timestamp is also past the cancel delay. The delay is for a press
@@ -283,29 +340,55 @@ impl Machine {
             && self.past_threshold(ev.x, ev.y)
         {
             self.begin_capture(ev.x, ev.y);
-            return swallow(Command::None);
+            return self.with_deferred(swallow(Command::None));
         }
 
         if self.phase == Phase::Pending && self.timed_out(ev.time_ms) {
             return self.timeout_then(ev);
         }
 
+        if self.phase == Phase::Pending
+            && ev.kind != EventKind::Move
+            && ev.button != self.config.primary
+        {
+            return self.defer_other(ev);
+        }
+
         self.dispatch(ev)
     }
 
-    /// Cancel delay elapsed with no further input. Returns [`Command::ReinjectPress`]
-    /// once, then [`Command::None`] until the next press.
-    pub fn poll_timeout(&mut self, now_ms: u32) -> Command {
+    /// Cancel delay elapsed with no further input.
+    ///
+    /// `physically_down` is the real button (GetAsyncKeyState). When it is
+    /// already up, the release was lost: inject nothing.
+    pub fn poll_timeout(&mut self, now_ms: u32, physically_down: bool) -> Output {
         if self.phase != Phase::Pending || !self.timed_out(now_ms) {
-            return Command::None;
+            return pass();
         }
         let button = self.button;
         let x = self.origin_x;
         let y = self.origin_y;
-        self.mark_delivered(button, x, y);
         self.phase = Phase::Idle;
         self.len = 0;
-        Command::ReinjectPress { button, x, y }
+        if !physically_down {
+            self.delivered_down = false;
+            self.swallow_next = true;
+            return self.with_deferred(pass());
+        }
+        self.mark_delivered(button, x, y);
+        self.with_deferred(swallow(Command::ReinjectPress { button, x, y }))
+    }
+
+    /// Capturing with no events for [`CAPTURE_INACTIVITY_MS`] drops the stroke
+    /// and injects nothing.
+    pub fn poll_inactivity(&mut self, now_ms: u32) -> Neutralize {
+        if self.phase != Phase::Capturing {
+            return Neutralize::None;
+        }
+        if now_ms.wrapping_sub(self.last_event_ms) < CAPTURE_INACTIVITY_MS {
+            return Neutralize::None;
+        }
+        self.recover(RecoverKind::Inactivity, false)
     }
 
     /// Milliseconds until [`Self::poll_timeout`] would fire, if a press is pending.
@@ -318,38 +401,78 @@ impl Machine {
         Some(self.config.cancel_delay_ms.saturating_sub(elapsed))
     }
 
-    /// Drop capture or a delivered press so input cannot stay stuck.
+    /// Leave Pending or Capturing without a normal release.
     ///
-    /// Shutdown and the stall watchdog call this. The returned action is
-    /// injected by the caller. After it returns, the machine is [`Phase::Idle`]
-    /// and [`Self::delivered_down`] is false.
-    pub fn neutralize(&mut self) -> Neutralize {
-        if self.phase != Phase::Idle {
-            let button = self.button;
-            let x = self.origin_x;
-            let y = self.origin_y;
-            self.phase = Phase::Idle;
-            self.len = 0;
+    /// `physically_down` is the real button. Capturing never injects: the
+    /// target was not given the press, and the next primary release is
+    /// swallowed. Pending injects a press only when the button is still down
+    /// and the caller is the watchdog or shutdown. A session change never
+    /// leaves the target holding the button.
+    pub fn recover(&mut self, kind: RecoverKind, physically_down: bool) -> Neutralize {
+        let phase = self.phase;
+        let button = self.button;
+        let x = self.origin_x;
+        let y = self.origin_y;
+        let delivered = self.delivered_down;
+        let delivered_button = self.delivered_button;
+        let delivered_x = self.delivered_x;
+        let delivered_y = self.delivered_y;
+
+        self.phase = Phase::Idle;
+        self.len = 0;
+        self.stroke_ready = false;
+        self.deferred_len = 0;
+
+        if phase == Phase::Capturing {
             self.delivered_down = false;
-            return Neutralize::SyntheticClick { button, x, y };
+            self.swallow_next = true;
+            return Neutralize::Drop;
         }
-        if self.delivered_down {
-            let button = self.delivered_button;
-            let x = self.delivered_x;
-            let y = self.delivered_y;
+
+        if phase == Phase::Pending {
+            let hold =
+                matches!(kind, RecoverKind::Watchdog | RecoverKind::Shutdown) && physically_down;
+            if hold {
+                self.mark_delivered(button, x, y);
+                return Neutralize::DeliverPress { button, x, y };
+            }
+            if kind == RecoverKind::Shutdown && !physically_down {
+                self.delivered_down = false;
+                self.swallow_next = true;
+                return Neutralize::SyntheticClick { button, x, y };
+            }
             self.delivered_down = false;
-            return Neutralize::SyntheticRelease { button, x, y };
+            self.swallow_next = true;
+            return Neutralize::Drop;
+        }
+
+        if delivered {
+            let release_it = !physically_down
+                || matches!(
+                    kind,
+                    RecoverKind::Session | RecoverKind::Inactivity | RecoverKind::Overflow
+                );
+            if release_it {
+                self.delivered_down = false;
+                self.swallow_next = true;
+                return Neutralize::DeliverRelease {
+                    button: delivered_button,
+                    x: delivered_x,
+                    y: delivered_y,
+                };
+            }
         }
         Neutralize::None
     }
 
-    /// The watchdog already injected the corrective input. Forget local state
-    /// without asking for a second injection.
-    pub fn force_idle(&mut self) {
+    /// The watchdog already injected. Adopt that outcome without a second injection.
+    pub fn adopt_recovery(&mut self, delivered: bool, swallow_next: bool) {
         self.phase = Phase::Idle;
         self.len = 0;
-        self.delivered_down = false;
         self.stroke_ready = false;
+        self.deferred_len = 0;
+        self.delivered_down = delivered;
+        self.swallow_next = swallow_next;
     }
 
     fn timeout_then(&mut self, ev: InputEvent) -> Output {
@@ -360,7 +483,7 @@ impl Machine {
         self.phase = Phase::Idle;
         self.len = 0;
         let follow = self.dispatch(ev);
-        if follow.decision == Decision::Pass {
+        let mut output = if follow.decision == Decision::Pass {
             Output {
                 decision: Decision::Swallow,
                 command: Command::ReinjectPress { button, x, y },
@@ -370,14 +493,18 @@ impl Machine {
                     x: ev.x,
                     y: ev.y,
                 }),
+                ..pass()
             }
         } else {
             Output {
                 decision: follow.decision,
                 command: Command::ReinjectPress { button, x, y },
                 replay: None,
+                ..pass()
             }
-        }
+        };
+        output = self.with_deferred(output);
+        output
     }
 
     fn dispatch(&mut self, ev: InputEvent) -> Output {
@@ -389,14 +516,30 @@ impl Machine {
     }
 
     fn on_press(&mut self, ev: InputEvent) -> Output {
-        if ev.button != self.config.primary || self.phase != Phase::Idle {
+        if ev.button != self.config.primary {
             return pass();
+        }
+        if self.phase != Phase::Idle {
+            // The release never arrived. Nothing was delivered, so drop the
+            // stale stroke and start again from this press.
+            let flushed = self.with_deferred(swallow(Command::None));
+            self.phase = Phase::Idle;
+            self.len = 0;
+            self.stroke_ready = false;
+            self.swallow_next = false;
+            self.begin_pending(ev);
+            return flushed;
         }
         // A second down without a release is not a new stroke. The target
         // already has this button, or a duplicate down arrived.
         if self.delivered_down && ev.button == self.delivered_button {
             return pass();
         }
+        self.begin_pending(ev);
+        swallow(Command::None)
+    }
+
+    fn begin_pending(&mut self, ev: InputEvent) {
         self.phase = Phase::Pending;
         self.button = ev.button;
         self.origin_x = ev.x;
@@ -404,10 +547,16 @@ impl Machine {
         self.origin_ms = ev.time_ms;
         self.len = 0;
         self.stroke_ready = false;
-        swallow(Command::None)
+        self.deferred_len = 0;
+        self.swallow_next = false;
     }
 
     fn on_release(&mut self, ev: InputEvent) -> Output {
+        if ev.button == self.config.primary && self.phase == Phase::Idle && self.swallow_next {
+            self.swallow_next = false;
+            self.delivered_down = false;
+            return swallow(Command::None);
+        }
         let cleared = self.note_delivered_release(&ev);
         if ev.button != self.config.primary {
             return pass();
@@ -423,11 +572,12 @@ impl Machine {
                 let y = self.origin_y;
                 self.phase = Phase::Idle;
                 self.len = 0;
-                Output {
+                self.with_deferred(Output {
                     decision: Decision::Swallow,
                     command: Command::ReinjectClick { button, x, y },
                     replay: None,
-                }
+                    ..pass()
+                })
             }
             Phase::Capturing => {
                 self.push_point(ev.x, ev.y);
@@ -436,7 +586,7 @@ impl Machine {
                 Output {
                     decision: Decision::Swallow,
                     command: Command::Stroke,
-                    replay: None,
+                    ..pass()
                 }
             }
         }
@@ -486,6 +636,30 @@ impl Machine {
         self.len = 0;
     }
 
+    fn defer_other(&mut self, ev: InputEvent) -> Output {
+        if (self.deferred_len as usize) < DEFERRED_CAP {
+            let index = self.deferred_len as usize;
+            self.deferred[index] = Replay {
+                kind: ev.kind,
+                button: ev.button,
+                x: ev.x,
+                y: ev.y,
+            };
+            self.deferred_len += 1;
+            swallow(Command::None)
+        } else {
+            // The buffer is full. Deliver this one now rather than drop it.
+            pass()
+        }
+    }
+
+    fn with_deferred(&mut self, mut output: Output) -> Output {
+        output.deferred = self.deferred;
+        output.deferred_len = self.deferred_len;
+        self.deferred_len = 0;
+        output
+    }
+
     fn past_threshold(&self, x: i32, y: i32) -> bool {
         let dx = i64::from(x) - i64::from(self.origin_x);
         let dy = i64::from(y) - i64::from(self.origin_y);
@@ -517,11 +691,22 @@ impl Machine {
     }
 }
 
+fn empty_replay() -> Replay {
+    Replay {
+        kind: EventKind::Move,
+        button: Button::Left,
+        x: 0,
+        y: 0,
+    }
+}
+
 fn pass() -> Output {
     Output {
         decision: Decision::Pass,
         command: Command::None,
         replay: None,
+        deferred: [empty_replay(); DEFERRED_CAP],
+        deferred_len: 0,
     }
 }
 
@@ -529,7 +714,7 @@ fn swallow(command: Command) -> Output {
     Output {
         decision: Decision::Swallow,
         command,
-        replay: None,
+        ..pass()
     }
 }
 
@@ -638,9 +823,9 @@ mod tests {
     fn timeout_reinjects_press_and_the_later_release_passes() {
         let mut m = machine();
         m.handle(input(EventKind::Press, Button::Right, 4, 5, 1_000));
-        assert_eq!(m.poll_timeout(1_499), Command::None);
+        assert_eq!(m.poll_timeout(1_499, true).command, Command::None);
         assert_eq!(m.ms_until_timeout(1_000), Some(500));
-        let command = m.poll_timeout(1_500);
+        let command = m.poll_timeout(1_500, true).command;
         assert_eq!(
             command,
             Command::ReinjectPress {
@@ -651,7 +836,7 @@ mod tests {
         );
         assert_eq!(m.phase(), Phase::Idle);
         assert!(m.delivered_down());
-        assert_eq!(m.poll_timeout(2_000), Command::None);
+        assert_eq!(m.poll_timeout(2_000, true).command, Command::None);
         let release = m.handle(input(EventKind::Release, Button::Right, 8, 9, 1_800));
         assert_eq!(release.decision, Decision::Pass);
         assert_eq!(release.command, Command::None);
@@ -756,66 +941,167 @@ mod tests {
     }
 
     #[test]
-    fn neutralize_pending_and_capturing_pairs_the_press() {
+    fn watchdog_pending_injects_press_only_while_held() {
         let mut pending = machine();
         pending.handle(input(EventKind::Press, Button::Right, 8, 9, 0));
         assert_eq!(
-            pending.neutralize(),
-            Neutralize::SyntheticClick {
+            pending.recover(RecoverKind::Watchdog, true),
+            Neutralize::DeliverPress {
                 button: Button::Right,
                 x: 8,
                 y: 9
             }
         );
         assert_eq!(pending.phase(), Phase::Idle);
-        assert!(!pending.delivered_down());
+        assert!(pending.delivered_down());
 
+        let mut up = machine();
+        up.handle(input(EventKind::Press, Button::Right, 8, 9, 0));
+        assert_eq!(up.recover(RecoverKind::Watchdog, false), Neutralize::Drop);
+        assert!(!up.delivered_down());
+        assert!(up.swallow_next_release());
+    }
+
+    #[test]
+    fn capturing_recovery_injects_nothing() {
         let mut capturing = machine();
         capturing.handle(input(EventKind::Press, Button::Right, 1, 1, 0));
         capturing.handle(input(EventKind::Move, Button::Right, 40, 1, 10));
         assert_eq!(
-            capturing.neutralize(),
-            Neutralize::SyntheticClick {
-                button: Button::Right,
-                x: 1,
-                y: 1
-            }
+            capturing.recover(RecoverKind::Watchdog, true),
+            Neutralize::Drop
         );
         assert_eq!(capturing.phase(), Phase::Idle);
+        assert!(!capturing.delivered_down());
+        let release = capturing.handle(input(EventKind::Release, Button::Right, 40, 1, 20));
+        assert_eq!(release.decision, Decision::Swallow);
+        assert_eq!(release.command, Command::None);
+        assert!(!capturing.swallow_next_release());
     }
 
     #[test]
-    fn neutralize_after_timeout_releases_the_delivered_press() {
-        let mut m = machine();
-        m.handle(input(EventKind::Press, Button::Right, 2, 3, 0));
-        assert!(matches!(m.poll_timeout(500), Command::ReinjectPress { .. }));
+    fn shutdown_click_only_when_the_button_is_up() {
+        let mut up = machine();
+        up.handle(input(EventKind::Press, Button::Right, 2, 3, 0));
         assert_eq!(
-            m.neutralize(),
-            Neutralize::SyntheticRelease {
+            up.recover(RecoverKind::Shutdown, false),
+            Neutralize::SyntheticClick {
                 button: Button::Right,
                 x: 2,
                 y: 3
             }
         );
-        assert!(!m.delivered_down());
-        assert_eq!(m.neutralize(), Neutralize::None);
+        let mut down = machine();
+        down.handle(input(EventKind::Press, Button::Right, 2, 3, 0));
+        assert_eq!(
+            down.recover(RecoverKind::Shutdown, true),
+            Neutralize::DeliverPress {
+                button: Button::Right,
+                x: 2,
+                y: 3
+            }
+        );
     }
 
     #[test]
-    fn force_idle_does_not_ask_for_input() {
+    fn session_change_does_not_deliver_a_press() {
+        let mut pending = machine();
+        pending.handle(input(EventKind::Press, Button::Right, 4, 5, 0));
+        assert_eq!(
+            pending.recover(RecoverKind::Session, true),
+            Neutralize::Drop
+        );
+        assert!(!pending.delivered_down());
+    }
+
+    #[test]
+    fn lost_release_then_a_new_press_starts_clean() {
         let mut m = machine();
         m.handle(input(EventKind::Press, Button::Right, 0, 0, 0));
-        m.force_idle();
+        m.handle(input(EventKind::Move, Button::Right, 50, 0, 10));
+        assert_eq!(m.phase(), Phase::Capturing);
+        let press = m.handle(input(EventKind::Press, Button::Right, 300, 300, 5_000));
+        assert_eq!(press.decision, Decision::Swallow);
+        assert_eq!(press.command, Command::None);
+        assert_eq!(m.phase(), Phase::Pending);
+        assert!(!m.delivered_down());
+        let release = m.handle(input(EventKind::Release, Button::Right, 300, 300, 5_050));
+        assert_eq!(
+            release.command,
+            Command::ReinjectClick {
+                button: Button::Right,
+                x: 300,
+                y: 300
+            }
+        );
         assert_eq!(m.phase(), Phase::Idle);
-        assert_eq!(m.neutralize(), Neutralize::None);
+    }
+
+    #[test]
+    fn timeout_with_the_button_already_up_injects_nothing() {
+        let mut m = machine();
+        m.handle(input(EventKind::Press, Button::Right, 1, 2, 0));
+        let output = m.poll_timeout(500, false);
+        assert_eq!(output.command, Command::None);
+        assert_eq!(m.phase(), Phase::Idle);
+        assert!(!m.delivered_down());
+        assert!(m.swallow_next_release());
+    }
+
+    #[test]
+    fn other_button_during_pending_is_deferred() {
+        let mut m = machine();
+        m.handle(input(EventKind::Press, Button::Right, 0, 0, 0));
+        let left = m.handle(input(EventKind::Press, Button::Left, 1, 1, 10));
+        assert_eq!(left.decision, Decision::Swallow);
+        assert_eq!(left.deferred_len, 0);
+        let release = m.handle(input(EventKind::Release, Button::Right, 0, 0, 20));
+        assert_eq!(
+            release.command,
+            Command::ReinjectClick {
+                button: Button::Right,
+                x: 0,
+                y: 0
+            }
+        );
+        assert_eq!(release.deferred_len, 1);
+        assert_eq!(release.deferred[0].button, Button::Left);
+        assert_eq!(release.deferred[0].kind, EventKind::Press);
+    }
+
+    #[test]
+    fn inactivity_drops_a_capture() {
+        let mut m = machine();
+        m.handle(input(EventKind::Press, Button::Right, 0, 0, 0));
+        m.handle(input(EventKind::Move, Button::Right, 40, 0, 10));
+        assert_eq!(
+            m.poll_inactivity(10 + CAPTURE_INACTIVITY_MS - 1),
+            Neutralize::None
+        );
+        assert_eq!(
+            m.poll_inactivity(10 + CAPTURE_INACTIVITY_MS),
+            Neutralize::Drop
+        );
+        assert_eq!(m.phase(), Phase::Idle);
+        assert!(!m.delivered_down());
+    }
+
+    #[test]
+    fn adopt_recovery_does_not_invent_a_command() {
+        let mut m = machine();
+        m.handle(input(EventKind::Press, Button::Right, 0, 0, 0));
+        m.adopt_recovery(false, true);
+        assert_eq!(m.phase(), Phase::Idle);
+        assert!(m.swallow_next_release());
+        assert_eq!(m.recover(RecoverKind::Watchdog, true), Neutralize::None);
     }
 
     #[test]
     fn timeout_wraps_the_tick_clock() {
         let mut m = machine();
         m.handle(input(EventKind::Press, Button::Right, 0, 0, u32::MAX - 10));
-        assert_eq!(m.poll_timeout(u32::MAX), Command::None);
-        let command = m.poll_timeout(489);
+        assert_eq!(m.poll_timeout(u32::MAX, true).command, Command::None);
+        let command = m.poll_timeout(489, true).command;
         assert!(matches!(command, Command::ReinjectPress { .. }));
     }
 

@@ -189,11 +189,39 @@ impl GestureFile {
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), GestureIoError> {
     let tmp = path.with_extension("json.tmp");
     fs::write(&tmp, bytes)?;
-    if path.exists() {
-        fs::remove_file(path)?;
-    }
-    fs::rename(&tmp, path)?;
+    replace_file(&tmp, path)?;
     Ok(())
+}
+
+fn replace_file(from: &Path, to: &Path) -> Result<(), GestureIoError> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let wide = |path: &Path| {
+            path.as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect::<Vec<u16>>()
+        };
+        let from_w = wide(from);
+        let to_w = wide(to);
+        extern "system" {
+            fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
+        }
+        // MOVEFILE_REPLACE_EXISTING. The destination name switches to the
+        // completed temp file in one call, so a crash cannot leave a missing file.
+        const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+        let ok = unsafe { MoveFileExW(from_w.as_ptr(), to_w.as_ptr(), MOVEFILE_REPLACE_EXISTING) };
+        if ok == 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        fs::rename(from, to)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

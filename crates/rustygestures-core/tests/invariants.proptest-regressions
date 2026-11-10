@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 61f5d5f05ec47e7000adb6ceb1aa3af757bab9eb8237cb69143b9a3b1f95e60a # shrinks to steps = [Input { kind: Press, button: Right, dx: 0, dy: 0, dt: 0, injected: false, touch_or_pen: false }, Input { kind: Move, button: Left, dx: 0, dy: 10, dt: 0, injected: false, touch_or_pen: false }, LostRelease, Input { kind: Press, button: Right, dx: 0, dy: 0, dt: 0, injected: false, touch_or_pen: false }]

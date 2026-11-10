@@ -42,10 +42,10 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, RegisterClassExW,
-    SetLayeredWindowAttributes, SetWindowPos, ShowWindow, UnregisterClassW, HMENU, HTTRANSPARENT,
-    LWA_ALPHA, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, WM_DISPLAYCHANGE,
-    WM_DPICHANGED, WM_NCHITTEST, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    SetLayeredWindowAttributes, ShowWindow, UnregisterClassW, HMENU, HTTRANSPARENT, LWA_ALPHA,
+    SW_HIDE, SW_SHOWNOACTIVATE, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_NCHITTEST, WNDCLASSEXW,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows_numerics::Vector2;
 
@@ -78,6 +78,7 @@ struct MonitorWindow {
     pixel_width: u32,
     pixel_height: u32,
     shown: bool,
+    last_sig: u64,
 }
 
 pub(crate) struct Overlay {
@@ -130,6 +131,9 @@ impl Overlay {
         if self.flags.rebuild.swap(false, Ordering::AcqRel) {
             self.hide_all();
             self.windows.clear();
+            if self.gpu.is_none() {
+                self.gpu = Gpu::new().ok();
+            }
             if let Err(err) = self.rebuild() {
                 eprintln!("rustygestures: display change rebuild failed ({err})");
             }
@@ -150,6 +154,10 @@ impl Overlay {
                 for window in &mut self.windows {
                     let local = local_points(points, window.origin);
                     if let Err(err) = window.paint(&dcomp, &local) {
+                        if device_removed(&err) {
+                            self.flags.rebuild.store(true, Ordering::Release);
+                            self.gpu = None;
+                        }
                         eprintln!("rustygestures: trail paint failed ({err})");
                     }
                     window.set_shown(true);
@@ -272,18 +280,12 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_DPICHANGED => {
-            let rect = &*(lparam.0 as *const RECT);
-            let _ = SetWindowPos(
-                hwnd,
-                None,
-                rect.left,
-                rect.top,
-                rect.right - rect.left,
-                rect.bottom - rect.top,
-                SWP_NOZORDER | SWP_NOACTIVATE,
-            );
+            // The suggested rect is for the window that received the message.
+            // These windows are one per monitor, so rebuild from the monitor
+            // list instead of resizing this one to that rect.
+            let _ = lparam;
             if let Some(flags) = flags() {
-                flags.resize.store(true, Ordering::Release);
+                flags.rebuild.store(true, Ordering::Release);
             }
             LRESULT(0)
         }
@@ -430,6 +432,7 @@ impl MonitorWindow {
             pixel_width: width,
             pixel_height: height,
             shown: false,
+            last_sig: 0,
         };
         window.bind_bitmap()?;
         Ok(window)
@@ -471,6 +474,11 @@ impl MonitorWindow {
         dcomp: &IDCompositionDevice,
         points: &[(f32, f32)],
     ) -> windows::core::Result<()> {
+        let sig = point_sig(points);
+        if self.shown && sig == self.last_sig {
+            return Ok(());
+        }
+        self.last_sig = sig;
         if self.bitmap.is_none() {
             self.bind_bitmap()?;
         }
@@ -512,7 +520,12 @@ impl MonitorWindow {
             self.target.EndDraw(None, None)?;
         }
         let base: IDXGISwapChain = self.swap.cast()?;
-        let hr = unsafe { base.Present(1, Default::default()) };
+        // Present(0) does not wait for vertical sync, so several monitors
+        // do not stall the trail thread one refresh each.
+        let hr = unsafe { base.Present(0, Default::default()) };
+        if device_removed_hr(hr) {
+            return Err(windows::core::Error::from(hr));
+        }
         hr.ok()?;
         unsafe { dcomp.Commit()? };
         Ok(())
@@ -549,6 +562,32 @@ fn bitmap_props() -> D2D1_BITMAP_PROPERTIES1 {
         bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
         ..Default::default()
     }
+}
+
+fn point_sig(points: &[(f32, f32)]) -> u64 {
+    let mut sig = points.len() as u64;
+    if let Some(point) = points.first() {
+        sig = sig
+            .wrapping_mul(31)
+            .wrapping_add(point.0.to_bits() as u64)
+            .wrapping_add(point.1.to_bits() as u64);
+    }
+    if let Some(point) = points.last() {
+        sig = sig
+            .wrapping_mul(31)
+            .wrapping_add(point.0.to_bits() as u64)
+            .wrapping_add(point.1.to_bits() as u64);
+    }
+    sig
+}
+
+fn device_removed(err: &windows::core::Error) -> bool {
+    device_removed_hr(err.code())
+}
+
+fn device_removed_hr(hr: windows::core::HRESULT) -> bool {
+    let code = hr.0 as u32;
+    code == 0x887A_0005 || code == 0x887A_0007
 }
 
 fn local_points(points: &[(i32, i32)], origin: POINT) -> Vec<(f32, f32)> {

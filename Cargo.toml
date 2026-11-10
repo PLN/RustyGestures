@@ -13,4 +13,4 @@ edition = "2021"
 license = "MIT"
 publish = false
 authors = ["PLN <78331+PLN@users.noreply.github.com>"]
-rust-version = "1.83"
+rust-version = "1.85"

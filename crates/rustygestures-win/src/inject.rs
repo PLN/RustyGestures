@@ -54,6 +54,19 @@ pub(crate) fn inject_replay(replay: Replay) {
     send(&inputs);
 }
 
+/// Input that is not tagged as ours, so the hook treats it as a real user event.
+pub(crate) fn inject_plain(kind: EventKind, button: Button, x: i32, y: i32) {
+    let (dx, dy) = absolute(x, y);
+    let (flags, data) = match kind {
+        EventKind::Move => (MOUSEEVENTF_MOVE, 0),
+        EventKind::Press => (down_flag(button), mouse_data(button)),
+        EventKind::Release => (up_flag(button), mouse_data(button)),
+    };
+    let mut input = mouse(dx, dy, flags, data);
+    input.Anonymous.mi.dwExtraInfo = 0;
+    send(&[input]);
+}
+
 fn send(inputs: &[INPUT]) {
     unsafe {
         SendInput(inputs, std::mem::size_of::<INPUT>() as i32);
@@ -116,6 +129,27 @@ fn norm(value: i32, origin: i32, span: i32) -> i32 {
         return 0;
     }
     let relative = i64::from(value) - i64::from(origin);
-    let scaled = relative * 65535 / i64::from(span - 1);
-    scaled.clamp(0, 65535) as i32
+    let denom = i64::from(span - 1);
+    // Round to nearest so the mapped pixel is not systematically one short.
+    let numer = relative * 65535;
+    let rounded = if numer >= 0 {
+        (numer + denom / 2) / denom
+    } else {
+        (numer - denom / 2) / denom
+    };
+    rounded.clamp(0, 65535) as i32
+}
+
+pub(crate) fn button_is_down(button: Button) -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        GetAsyncKeyState, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON, VK_XBUTTON1, VK_XBUTTON2,
+    };
+    let vk = match button {
+        Button::Left => VK_LBUTTON,
+        Button::Right => VK_RBUTTON,
+        Button::Middle => VK_MBUTTON,
+        Button::X1 => VK_XBUTTON1,
+        Button::X2 => VK_XBUTTON2,
+    };
+    (unsafe { GetAsyncKeyState(i32::from(vk.0)) } as u16) & 0x8000 != 0
 }

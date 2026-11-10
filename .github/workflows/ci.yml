@@ -19,7 +19,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # 2026-10-16
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1 (master)
         with:
           toolchain: stable
           components: rustfmt, clippy
@@ -29,13 +29,13 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
 
       - name: Release build
-        run: cargo build --release --target x86_64-pc-windows-msvc
+        run: cargo build --locked --release --target x86_64-pc-windows-msvc
 
       - name: Install cargo-deny
         shell: pwsh
@@ -44,7 +44,12 @@ jobs:
           $ver = '0.20.2'
           $name = "cargo-deny-$ver-x86_64-pc-windows-msvc"
           $url = "https://github.com/EmbarkStudios/cargo-deny/releases/download/$ver/$name.tar.gz"
+          $expected = '975A22143262FD27476D19EE00C7AF67978426E40E1DEE94EED6BBADE1CF87DC'
           Invoke-WebRequest -Uri $url -OutFile cargo-deny.tar.gz
+          $actual = (Get-FileHash -Algorithm SHA256 cargo-deny.tar.gz).Hash
+          if ($actual -ne $expected) {
+            throw "cargo-deny checksum mismatch: $actual"
+          }
           tar -xzf cargo-deny.tar.gz
           New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\.cargo\bin" | Out-Null
           Copy-Item -Force "$name\cargo-deny.exe" "$env:USERPROFILE\.cargo\bin\cargo-deny.exe"

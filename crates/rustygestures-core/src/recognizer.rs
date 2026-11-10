@@ -4,7 +4,10 @@
 //! resample and centroid translation from $1 (Wobbrock, Wilson, and Li, UIST 2007),
 //! aspect-preserving scale for a near-straight stroke from $N (Anthony and
 //! Wobbrock, 2010), and the closed-form rotation from Protractor (Li, CHI 2010),
-//! clamped to ±30° so direction still matters.
+//! The score is the $1 path-distance score on a 0–1 scale (1 is a perfect
+//! overlap). Protractor supplies only the closed-form angle, and that angle is
+//! a gate: if the unclamped optimum is outside ±30°, the template is rejected
+//! even when it is the only one.
 //!
 //! A template is accepted when its score is at least 0.80 and it leads the
 //! next-best *other* gesture by at least 0.05.
@@ -100,7 +103,9 @@ impl GestureSet {
         for gesture in &self.gestures {
             let mut gesture_score = f64::NEG_INFINITY;
             for sample in &gesture.samples {
-                let score = score_pair(&sample.points, &candidate);
+                let Some(score) = score_pair(&sample.points, &candidate) else {
+                    continue;
+                };
                 if score > gesture_score {
                     gesture_score = score;
                 }
@@ -303,8 +308,14 @@ fn bounds(points: &[Vec2]) -> Option<(f64, f64, f64, f64)> {
     Some((min_x, min_y, max_x, max_y))
 }
 
-/// Closed-form Protractor angle, then the $1 score of the rotated candidate.
-fn score_pair(template: &[Vec2; RESAMPLE_POINTS], candidate: &[Vec2; RESAMPLE_POINTS]) -> f64 {
+/// Closed-form Protractor angle, then the $1 path-distance score.
+///
+/// `None` means the best rotation is outside ±30°, so the template does not
+/// match this orientation.
+fn score_pair(
+    template: &[Vec2; RESAMPLE_POINTS],
+    candidate: &[Vec2; RESAMPLE_POINTS],
+) -> Option<f64> {
     let mut a = 0.0;
     let mut b = 0.0;
     for i in 0..RESAMPLE_POINTS {
@@ -315,7 +326,10 @@ fn score_pair(template: &[Vec2; RESAMPLE_POINTS], candidate: &[Vec2; RESAMPLE_PO
         // with this `b`. The maximizing θ is `atan2(b, a)`.
         b += t.y * c.x - t.x * c.y;
     }
-    let theta = b.atan2(a).clamp(-ROTATION_LIMIT_RAD, ROTATION_LIMIT_RAD);
+    let theta = b.atan2(a);
+    if theta.abs() > ROTATION_LIMIT_RAD {
+        return None;
+    }
     let (sin_t, cos_t) = theta.sin_cos();
     let mut rotated = [Vec2 { x: 0.0, y: 0.0 }; RESAMPLE_POINTS];
     for i in 0..RESAMPLE_POINTS {
@@ -325,7 +339,7 @@ fn score_pair(template: &[Vec2; RESAMPLE_POINTS], candidate: &[Vec2; RESAMPLE_PO
             y: c.x * sin_t + c.y * cos_t,
         };
     }
-    path_score(template, &rotated)
+    Some(path_score(template, &rotated))
 }
 
 fn path_score(template: &[Vec2; RESAMPLE_POINTS], candidate: &[Vec2; RESAMPLE_POINTS]) -> f64 {
@@ -540,6 +554,17 @@ mod tests {
         assert!(found.score >= 0.80);
         assert!(found.margin >= 0.05, "margin {}", found.margin);
         assert_eq!(set.recognize(&line(0, 0, 30, 0)).unwrap().name, "right");
+    }
+
+    #[test]
+    fn single_template_rejects_lines_past_thirty_degrees() {
+        let mut set = GestureSet::new();
+        set.insert_raw("right", &ray(0.0, 160.0));
+        let near = set.recognize(&ray(20.0, 160.0)).unwrap();
+        assert_eq!(near.name, "right");
+        assert!(near.score >= 0.90, "20° score {}", near.score);
+        assert!(set.recognize(&ray(45.0, 160.0)).is_none());
+        assert!(set.recognize(&ray(60.0, 160.0)).is_none());
     }
 
     #[test]
