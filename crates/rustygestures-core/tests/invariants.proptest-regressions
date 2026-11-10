@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 61f5d5f05ec47e7000adb6ceb1aa3af757bab9eb8237cb69143b9a3b1f95e60a # shrinks to steps = [Input { kind: Press, button: Right, dx: 0, dy: 0, dt: 0, injected: false, touch_or_pen: false }, Input { kind: Move, button: Left, dx: 0, dy: 10, dt: 0, injected: false, touch_or_pen: false }, LostRelease, Input { kind: Press, button: Right, dx: 0, dy: 0, dt: 0, injected: false, touch_or_pen: false }]
+cc 2242a5e27212266e65b790928e302e5f1224828d6a53501b9047032286cbc95f # shrinks to steps = [Input { kind: Press, button: Right, dx: 0, dy: 0, dt: 0, injected: false, touch_or_pen: true }]
+cc 0abf4e787da12d85a94d4292876bd9add9bd3135d81fc05c019cf14eb5b882bf # shrinks to steps = [Input { kind: Press, button: Right, dx: 0, dy: 0, dt: 0, injected: false, touch_or_pen: false }, LostRelease, PollTimeout { dt: 0 }]
+cc b39d1069fbb04f45365d13e820b1e9cdaa3e6315f8922f1bbc92f15d9f90d6bc # shrinks to steps = [Input { kind: Press, button: Right, dx: 0, dy: 0, dt: 0, injected: false, touch_or_pen: false }, Input { kind: Press, button: Left, dx: 0, dy: 0, dt: 500, injected: false, touch_or_pen: false }, Input { kind: Release, button: Right, dx: 0, dy: 0, dt: 0, injected: false, touch_or_pen: true }, LostRelease]
