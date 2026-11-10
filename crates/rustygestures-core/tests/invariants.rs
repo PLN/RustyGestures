@@ -164,6 +164,7 @@ fn apply_neutralize(books: &mut Books, action: Neutralize) {
         }
         Neutralize::DeliverRelease { .. } => {
             books.target_down = false;
+            books.open_swallows = 0;
         }
     }
 }
@@ -361,10 +362,6 @@ proptest! {
             action.deferred_len,
         );
         apply_neutralize(&mut books, action.action);
-        if !books.physical_down {
-            books.target_down = false;
-            books.open_swallows = 0;
-        }
         check(&machine, &books);
         prop_assert_eq!(machine.phase(), Phase::Idle);
         if !books.physical_down {

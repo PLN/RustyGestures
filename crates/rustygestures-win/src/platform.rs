@@ -8,7 +8,7 @@
 
 use std::cell::Cell;
 use std::sync::atomic::{
-    AtomicBool, AtomicI32, AtomicIsize, AtomicPtr, AtomicU64, AtomicU8, Ordering,
+    AtomicBool, AtomicI32, AtomicIsize, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, Ordering,
 };
 use std::sync::Mutex;
 use std::thread::{self, JoinHandle};
@@ -38,6 +38,7 @@ use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObj
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_ESCAPE, VK_RBUTTON};
 use windows::Win32::UI::Input::{
     GetRawInputData, RegisterRawInputDevices, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER,
     RIDEV_INPUTSINK, RID_INPUT, RIM_TYPEMOUSE,
@@ -45,22 +46,32 @@ use windows::Win32::UI::Input::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     GetSystemMetrics, GetWindowRect, MsgWaitForMultipleObjects, PeekMessageW, RegisterClassExW,
-    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WindowFromPoint, HHOOK, HMENU, MSG,
-    MSLLHOOKSTRUCT, PM_REMOVE, QS_ALLINPUT, RI_MOUSE_RIGHT_BUTTON_DOWN, RI_MOUSE_RIGHT_BUTTON_UP,
-    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WH_MOUSE_LL,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_INPUT, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
-    WM_MBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_WTSSESSION_CHANGE, WM_XBUTTONDOWN,
-    WM_XBUTTONUP, WNDCLASSEXW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, WTS_CONSOLE_DISCONNECT,
-    WTS_REMOTE_DISCONNECT, WTS_SESSION_LOCK, WTS_SESSION_LOGOFF, XBUTTON2,
+    SendMessageW, SetForegroundWindow, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
+    WindowFromPoint, HHOOK, HMENU, MSG, MSLLHOOKSTRUCT, PM_REMOVE, QS_ALLINPUT, RIM_INPUT,
+    RI_MOUSE_LEFT_BUTTON_DOWN, RI_MOUSE_LEFT_BUTTON_UP, RI_MOUSE_RIGHT_BUTTON_DOWN,
+    RI_MOUSE_RIGHT_BUTTON_UP, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_SWAPBUTTON,
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WH_MOUSE_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_INPUT,
+    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_WTSSESSION_CHANGE, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSEXW,
+    WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, WTS_CONSOLE_DISCONNECT, WTS_REMOTE_DISCONNECT,
+    WTS_SESSION_LOCK, WTS_SESSION_LOGOFF, XBUTTON2,
 };
 
-use crate::inject::{button_from_u8, inject_click, inject_press, inject_release, inject_replay};
+use crate::inject::{
+    button_from_u8, inject_click, inject_press, inject_release, inject_release_in_place,
+    inject_replay,
+};
 use crate::overlay::Overlay;
 use crate::{Control, RunOptions, RunStats, SessionError};
 
 const HOOK_PENDING: u8 = 0;
 const HOOK_READY: u8 = 1;
 const HOOK_FAILED: u8 = 2;
+const RAW_UP_GRACE_MS: u64 = 50;
+const STALL_STILL_MS: u32 = 100;
+const PENDING_CAP: usize = 8;
+/// Posted to the fuzz window so `GetKeyState` runs on that thread.
+const WM_FUZZ_SAMPLE: u32 = 0x8000;
 
 struct Shared {
     histogram: LatencyHistogram,
@@ -76,11 +87,17 @@ struct Shared {
     stop: AtomicBool,
     session_change: AtomicBool,
     /// Right button, from non-injected hook events and raw input. Injected
-    /// events (`dwExtraInfo`) do not change it.
+    /// events (`dwExtraInfo`) do not change it. A raw "up" is applied only
+    /// after [`RAW_UP_GRACE_MS`] with no matching hook release.
     physical_down: AtomicBool,
+    /// QPC tick when a raw-input up was seen. Zero means none is pending.
+    raw_up_at: AtomicU64,
+    raw_input_ok: AtomicBool,
+    raw_input_error: Mutex<String>,
     dropped: AtomicU64,
     hook_status: AtomicU8,
     hook_error: Mutex<String>,
+    pending_overflow: AtomicBool,
     recovery_gen: AtomicU64,
     adopt_delivered: AtomicBool,
     adopt_swallow: AtomicBool,
@@ -97,6 +114,14 @@ struct Shared {
     fuzz_right: AtomicI32,
     fuzz_bottom: AtomicI32,
     fuzz_failed: AtomicBool,
+    fuzz_mode: bool,
+    fuzz_downs: AtomicU32,
+    fuzz_ups: AtomicU32,
+    fuzz_key_down: AtomicBool,
+    fuzz_snap_phase: AtomicU8,
+    fuzz_snap_delivered: AtomicBool,
+    fuzz_snap_physical: AtomicBool,
+    fuzz_snap_valid: AtomicBool,
 }
 
 thread_local! {
@@ -109,6 +134,22 @@ enum PendingInject {
     Output(Output),
 }
 
+struct PendingFifo {
+    slots: [Option<PendingInject>; PENDING_CAP],
+    head: usize,
+    len: usize,
+}
+
+impl PendingFifo {
+    fn new() -> Self {
+        Self {
+            slots: [None; PENDING_CAP],
+            head: 0,
+            len: 0,
+        }
+    }
+}
+
 static LOCAL: AtomicPtr<HookLocal> = AtomicPtr::new(std::ptr::null_mut());
 static SHARED_PTR: AtomicPtr<Shared> = AtomicPtr::new(std::ptr::null_mut());
 
@@ -118,7 +159,7 @@ struct HookLocal {
     hook: HHOOK,
     seen_recovery: u64,
     stall_used: bool,
-    pending: Option<PendingInject>,
+    pending: PendingFifo,
 }
 
 struct SessionGuard {
@@ -181,9 +222,13 @@ where
         stop: AtomicBool::new(false),
         session_change: AtomicBool::new(false),
         physical_down: AtomicBool::new(false),
+        raw_up_at: AtomicU64::new(0),
+        raw_input_ok: AtomicBool::new(false),
+        raw_input_error: Mutex::new(String::new()),
         dropped: AtomicU64::new(0),
         hook_status: AtomicU8::new(HOOK_PENDING),
         hook_error: Mutex::new(String::new()),
+        pending_overflow: AtomicBool::new(false),
         recovery_gen: AtomicU64::new(0),
         adopt_delivered: AtomicBool::new(false),
         adopt_swallow: AtomicBool::new(false),
@@ -199,6 +244,14 @@ where
         fuzz_right: AtomicI32::new(0),
         fuzz_bottom: AtomicI32::new(0),
         fuzz_failed: AtomicBool::new(false),
+        fuzz_mode: options.fuzz_seconds > 0,
+        fuzz_downs: AtomicU32::new(0),
+        fuzz_ups: AtomicU32::new(0),
+        fuzz_key_down: AtomicBool::new(false),
+        fuzz_snap_phase: AtomicU8::new(Phase::Idle as u8),
+        fuzz_snap_delivered: AtomicBool::new(false),
+        fuzz_snap_physical: AtomicBool::new(false),
+        fuzz_snap_valid: AtomicBool::new(false),
     }));
     let mut guard = SessionGuard {
         shared,
@@ -233,6 +286,16 @@ where
         return Err(SessionError(message));
     }
     println!("hook installed (right button, 10 px, 500 ms cancel). Ctrl+C to exit.");
+    if options.fuzz_seconds > 0 && !shared.raw_input_ok.load(Ordering::Acquire) {
+        let message = shared
+            .raw_input_error
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_else(|_| "raw input registration failed".to_owned());
+        return Err(SessionError(format!(
+            "raw input registration failed: {message}"
+        )));
+    }
 
     guard.watchdog = Some(
         thread::Builder::new()
@@ -304,15 +367,20 @@ where
         latency: shared.histogram.summary(),
         dropped_strokes: shared.dropped.load(Ordering::Relaxed),
         trail_active,
+        raw_input: shared.raw_input_ok.load(Ordering::Acquire),
     };
     if options.fuzz_seconds > 0 {
-        let idle = shared.phase.load(Ordering::Acquire) == Phase::Idle as u8;
-        let delivered = shared.delivered.load(Ordering::Acquire);
-        let physical = shared.physical_down.load(Ordering::Acquire);
+        let idle = shared.fuzz_snap_phase.load(Ordering::Acquire) == Phase::Idle as u8;
+        let delivered = shared.fuzz_snap_delivered.load(Ordering::Acquire);
+        let physical = shared.fuzz_snap_physical.load(Ordering::Acquire);
+        let snapped = shared.fuzz_snap_valid.load(Ordering::Acquire);
         let failed = shared.fuzz_failed.load(Ordering::Acquire);
-        if !idle || delivered || physical || failed {
+        let downs = shared.fuzz_downs.load(Ordering::Acquire);
+        let ups = shared.fuzz_ups.load(Ordering::Acquire);
+        let key_down = shared.fuzz_key_down.load(Ordering::Acquire);
+        if !snapped || !idle || delivered || physical || failed || downs != ups || key_down {
             return Err(SessionError(format!(
-                "fuzz ended with the engine not idle or the button down (idle={idle} delivered={delivered} physical={physical} confined={})",
+                "fuzz ended with the engine not idle or the button down (idle={idle} delivered={delivered} physical={physical} confined={} snapped={snapped} downs={downs} ups={ups} key_down={key_down})",
                 !failed
             )));
         }
@@ -340,7 +408,7 @@ fn hook_main(shared: &'static Shared) {
         hook: HHOOK::default(),
         seen_recovery: 0,
         stall_used: false,
-        pending: None,
+        pending: PendingFifo::new(),
     });
     let ptr = Box::into_raw(local);
     LOCAL.store(ptr, Ordering::Release);
@@ -360,12 +428,29 @@ fn hook_main(shared: &'static Shared) {
             return;
         }
     }
-    let raw_window = install_raw_input();
+    let raw_window = match install_raw_input() {
+        Ok(hwnd) => {
+            shared.raw_input_ok.store(true, Ordering::Release);
+            Some(hwnd)
+        }
+        Err(err) => {
+            if let Ok(mut slot) = shared.raw_input_error.lock() {
+                *slot = err.clone();
+            }
+            if !shared.fuzz_mode {
+                eprintln!(
+                    "rustygestures: warning: raw input registration failed ({err}); button tracking is hook-only"
+                );
+            }
+            None
+        }
+    };
     shared.hook_status.store(HOOK_READY, Ordering::Release);
     shared.heartbeat.store(qpc(), Ordering::Release);
     signal(shared.ready_event);
 
     while !shared.stop.load(Ordering::Acquire) {
+        apply_raw_up_grace(shared);
         if !flush_pending(ptr) {
             let _ = peek_posted(ptr);
             continue;
@@ -378,7 +463,7 @@ fn hook_main(shared: &'static Shared) {
         if shared.session_change.swap(false, Ordering::AcqRel) {
             let recovery = {
                 let local = unsafe { &mut *ptr };
-                let down = physical_down(local.shared);
+                let down = button_down(local.shared);
                 local.pump.machine_mut().recover(RecoverKind::Session, down)
             };
             if !store_or_apply(ptr, PendingInject::Recovery(recovery)) {
@@ -387,21 +472,29 @@ fn hook_main(shared: &'static Shared) {
             }
             publish(unsafe { &mut *ptr });
         }
+        let mut requeued = false;
         {
             let outputs = {
                 let local = unsafe { &mut *ptr };
                 poll_hook(&mut WinSource, &mut local.pump)
             };
-            for (index, output) in outputs.iter().copied().enumerate() {
+            for (index, output) in outputs.as_slice().iter().copied().enumerate() {
                 if try_apply_output(ptr, output) {
                     continue;
                 }
                 let local = unsafe { &mut *ptr };
-                for pending in outputs.iter().copied().skip(index).rev() {
+                for pending in outputs.as_slice().iter().copied().skip(index).rev() {
                     let _ = local.pump.push_front(pending);
                 }
+                requeued = true;
                 break;
             }
+        }
+        // A release or timeout computed after this requeue would be applied
+        // before the older command. Pump and retry the queue first.
+        if requeued && unsafe { (*ptr).pump.queue_len() } > 0 {
+            let _ = peek_posted(ptr);
+            continue;
         }
         if !flush_pending(ptr) {
             let _ = peek_posted(ptr);
@@ -415,9 +508,11 @@ fn hook_main(shared: &'static Shared) {
         }
         let stall = {
             let local = unsafe { &mut *ptr };
-            let down = physical_down(local.shared);
+            let down = button_down(local.shared);
             let now = tick_ms();
-            if local.pump.take_overflow() {
+            if local.shared.pending_overflow.swap(false, Ordering::AcqRel)
+                || local.pump.take_overflow()
+            {
                 let recovery = local
                     .pump
                     .machine_mut()
@@ -442,9 +537,11 @@ fn hook_main(shared: &'static Shared) {
             }
             reconcile_release(ptr);
             let local = unsafe { &mut *ptr };
+            let still_for = tick_ms().wrapping_sub(local.pump.machine().last_event_ms());
             let stall = local.shared.debug_stall_ms > 0
                 && !local.stall_used
-                && local.pump.machine().phase() == Phase::Capturing;
+                && local.pump.machine().phase() == Phase::Capturing
+                && still_for >= STALL_STILL_MS;
             if stall {
                 local.stall_used = true;
             }
@@ -452,6 +549,7 @@ fn hook_main(shared: &'static Shared) {
             stall
         };
         if stall {
+            println!("debug stall: sleeping {} ms", shared.debug_stall_ms);
             thread::sleep(Duration::from_millis(u64::from(shared.debug_stall_ms)));
         }
         shared.heartbeat.store(qpc(), Ordering::Release);
@@ -472,14 +570,15 @@ fn hook_main(shared: &'static Shared) {
         let _ = flush_pending(ptr);
         let recovery = {
             let local = unsafe { &mut *ptr };
-            let down = physical_down(local.shared);
+            let down = button_down(local.shared);
             local
                 .pump
                 .machine_mut()
                 .recover(RecoverKind::Shutdown, down)
         };
-        unsafe {
-            (*ptr).pending = Some(PendingInject::Recovery(recovery));
+        let fifo = unsafe { std::ptr::addr_of_mut!((*ptr).pending) };
+        if !pending_push(fifo, PendingInject::Recovery(recovery)) {
+            shared.pending_overflow.store(true, Ordering::Release);
         }
         for _ in 0..20 {
             if flush_pending(ptr) {
@@ -546,14 +645,17 @@ fn adopt_local(local: &mut HookLocal) {
 }
 
 fn adopt_pump(local_ptr: *mut HookLocal, pump: *mut CapturePump) {
-    let shared = unsafe { (*local_ptr).shared };
-    let seen = unsafe { (*local_ptr).seen_recovery };
+    // Field pointers only. A `&mut HookLocal` here would alias `pump`, which
+    // poll_hook already holds.
+    let shared = unsafe { std::ptr::addr_of!((*local_ptr).shared).read() };
+    let seen_ptr = unsafe { std::ptr::addr_of_mut!((*local_ptr).seen_recovery) };
+    let seen = unsafe { seen_ptr.read() };
     let generation = shared.recovery_gen.load(Ordering::Acquire);
     if generation == seen {
         return;
     }
     unsafe {
-        (*local_ptr).seen_recovery = generation;
+        seen_ptr.write(generation);
     }
     let delivered = shared.adopt_delivered.load(Ordering::Acquire);
     let swallow = shared.adopt_swallow.load(Ordering::Acquire);
@@ -561,42 +663,18 @@ fn adopt_pump(local_ptr: *mut HookLocal, pump: *mut CapturePump) {
     unsafe {
         (*pump).clear_queue();
     }
-    stash_recovery_ptr(local_ptr, recovery);
+    let fifo = unsafe { std::ptr::addr_of_mut!((*local_ptr).pending) };
+    if !pending_push_recovery(fifo, shared, recovery) {
+        shared.pending_overflow.store(true, Ordering::Release);
+    }
     publish_pump(shared, unsafe { &*pump });
 }
 
 fn stash_recovery(local: &mut HookLocal, recovery: Recovery) {
-    if !recovery_needs_inject(&recovery) {
-        return;
+    let fifo = std::ptr::addr_of_mut!(local.pending);
+    if !pending_push_recovery(fifo, local.shared, recovery) {
+        local.shared.pending_overflow.store(true, Ordering::Release);
     }
-    match local.pending {
-        Some(PendingInject::Recovery(existing)) => {
-            local.pending = Some(PendingInject::Recovery(merge_recovery(existing, recovery)));
-        }
-        Some(PendingInject::Output(_)) | None => {
-            if local.pending.is_none() {
-                local.pending = Some(PendingInject::Recovery(recovery));
-            }
-        }
-    }
-}
-
-fn stash_recovery_ptr(local_ptr: *mut HookLocal, recovery: Recovery) {
-    let local = unsafe { &mut *local_ptr };
-    stash_recovery(local, recovery);
-}
-
-fn merge_recovery(mut existing: Recovery, extra: Recovery) -> Recovery {
-    let space = DEFERRED_CAP.saturating_sub(existing.deferred_len as usize);
-    let add = (extra.deferred_len as usize).min(space);
-    for replay in extra.deferred.iter().take(add) {
-        existing.deferred[existing.deferred_len as usize] = *replay;
-        existing.deferred_len += 1;
-    }
-    if existing.action == Neutralize::None || existing.action == Neutralize::Drop {
-        existing.action = extra.action;
-    }
-    existing
 }
 
 fn recovery_needs_inject(recovery: &Recovery) -> bool {
@@ -609,27 +687,89 @@ fn recovery_needs_inject(recovery: &Recovery) -> bool {
         )
 }
 
-fn flush_pending(ptr: *mut HookLocal) -> bool {
-    let pending = unsafe { (*ptr).pending.take() };
-    let Some(pending) = pending else {
+fn pending_push(fifo: *mut PendingFifo, item: PendingInject) -> bool {
+    unsafe {
+        if (*fifo).len == PENDING_CAP {
+            return false;
+        }
+        let index = ((*fifo).head + (*fifo).len) % PENDING_CAP;
+        (*fifo).slots[index] = Some(item);
+        (*fifo).len += 1;
+        true
+    }
+}
+
+fn pending_push_front(fifo: *mut PendingFifo, item: PendingInject) -> bool {
+    unsafe {
+        if (*fifo).len == PENDING_CAP {
+            return false;
+        }
+        (*fifo).head = ((*fifo).head + PENDING_CAP - 1) % PENDING_CAP;
+        (*fifo).slots[(*fifo).head] = Some(item);
+        (*fifo).len += 1;
+        true
+    }
+}
+
+fn pending_pop(fifo: *mut PendingFifo) -> Option<PendingInject> {
+    unsafe {
+        if (*fifo).len == 0 {
+            return None;
+        }
+        let item = (*fifo).slots[(*fifo).head].take();
+        (*fifo).head = ((*fifo).head + 1) % PENDING_CAP;
+        (*fifo).len -= 1;
+        item
+    }
+}
+
+fn pending_is_empty(fifo: *mut PendingFifo) -> bool {
+    unsafe { (*fifo).len == 0 }
+}
+
+fn pending_push_recovery(fifo: *mut PendingFifo, shared: &Shared, recovery: Recovery) -> bool {
+    if !recovery_needs_inject(&recovery) {
         return true;
-    };
-    if apply_pending(ptr, pending) {
-        publish(unsafe { &mut *ptr });
+    }
+    if pending_push(fifo, PendingInject::Recovery(recovery)) {
         true
     } else {
-        unsafe {
-            (*ptr).pending = Some(pending);
-        }
+        shared.pending_overflow.store(true, Ordering::Release);
         false
     }
 }
 
+fn flush_pending(ptr: *mut HookLocal) -> bool {
+    let fifo = unsafe { std::ptr::addr_of_mut!((*ptr).pending) };
+    loop {
+        let Some(pending) = pending_pop(fifo) else {
+            return true;
+        };
+        if apply_pending(ptr, pending) {
+            publish(unsafe { &mut *ptr });
+            continue;
+        }
+        if !pending_push_front(fifo, pending) {
+            unsafe {
+                (*ptr)
+                    .shared
+                    .pending_overflow
+                    .store(true, Ordering::Release);
+            }
+        }
+        return false;
+    }
+}
+
 fn store_or_apply(ptr: *mut HookLocal, inject: PendingInject) -> bool {
+    let fifo = unsafe { std::ptr::addr_of_mut!((*ptr).pending) };
     if !flush_pending(ptr) {
-        unsafe {
-            if (*ptr).pending.is_none() {
-                (*ptr).pending = Some(inject);
+        if !pending_push(fifo, inject) {
+            unsafe {
+                (*ptr)
+                    .shared
+                    .pending_overflow
+                    .store(true, Ordering::Release);
             }
         }
         return false;
@@ -638,9 +778,14 @@ fn store_or_apply(ptr: *mut HookLocal, inject: PendingInject) -> bool {
         let local = unsafe { &mut *ptr };
         publish(local);
         true
+    } else if pending_push(fifo, inject) {
+        false
     } else {
         unsafe {
-            (*ptr).pending = Some(inject);
+            (*ptr)
+                .shared
+                .pending_overflow
+                .store(true, Ordering::Release);
         }
         false
     }
@@ -730,7 +875,8 @@ fn send_recovery(recovery: &Recovery) {
             replay_deferred(recovery.deferred, recovery.deferred_len);
         }
         Neutralize::DeliverRelease { button, x, y } => {
-            inject_release(button, x, y);
+            let _ = (x, y);
+            inject_release_in_place(button);
             replay_deferred(recovery.deferred, recovery.deferred_len);
         }
         Neutralize::SyntheticClick { button, x, y } => {
@@ -748,10 +894,11 @@ fn replay_deferred(deferred: [Replay; DEFERRED_CAP], len: u8) {
 }
 
 fn reconcile_release(ptr: *mut HookLocal) {
-    if unsafe { (*ptr).pending.is_some() } {
+    let fifo = unsafe { std::ptr::addr_of_mut!((*ptr).pending) };
+    if !pending_is_empty(fifo) {
         return;
     }
-    let down = physical_down(unsafe { (*ptr).shared });
+    let down = button_down(unsafe { (*ptr).shared });
     let action = {
         let local = unsafe { &mut *ptr };
         local.pump.machine_mut().release_if_delivered_and_up(down)
@@ -789,13 +936,44 @@ fn physical_down(shared: &Shared) -> bool {
     shared.physical_down.load(Ordering::Acquire)
 }
 
+fn button_down(shared: &Shared) -> bool {
+    apply_raw_up_grace(shared);
+    physical_down(shared)
+}
+
+/// A raw-input up waits out the grace period. A hook release in that window
+/// cancels it, so the real release is not replaced by one injected early.
+fn apply_raw_up_grace(shared: &Shared) {
+    let at = shared.raw_up_at.load(Ordering::Acquire);
+    if at == 0 {
+        return;
+    }
+    let age = ticks_to_ms(qpc().saturating_sub(at), shared.qpc_freq);
+    if age < RAW_UP_GRACE_MS {
+        return;
+    }
+    if shared
+        .raw_up_at
+        .compare_exchange(at, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        shared.physical_down.store(false, Ordering::Release);
+    }
+}
+
 fn note_physical(shared: &Shared, event: &InputEvent) {
     if event.injected || event.touch_or_pen || event.button != Button::Right {
         return;
     }
     match event.kind {
-        EventKind::Press => shared.physical_down.store(true, Ordering::Release),
-        EventKind::Release => shared.physical_down.store(false, Ordering::Release),
+        EventKind::Press => {
+            shared.raw_up_at.store(0, Ordering::Release);
+            shared.physical_down.store(true, Ordering::Release);
+        }
+        EventKind::Release => {
+            shared.raw_up_at.store(0, Ordering::Release);
+            shared.physical_down.store(false, Ordering::Release);
+        }
         EventKind::Move => {}
     }
 }
@@ -954,7 +1132,7 @@ fn watchdog_main(shared: &'static Shared) {
         let button = button_from_u8(shared.button.load(Ordering::Acquire));
         let x = shared.x.load(Ordering::Acquire);
         let y = shared.y.load(Ordering::Acquire);
-        let down = physical_down(shared);
+        let down = button_down(shared);
         if phase == Phase::Idle as u8 && !delivered {
             unlock(shared);
             continue;
@@ -980,8 +1158,21 @@ fn watchdog_main(shared: &'static Shared) {
             shared.phase.store(Phase::Idle as u8, Ordering::Release);
             shared.delivered.store(delivered_after, Ordering::Release);
             shared.recovery_gen.fetch_add(1, Ordering::Release);
+            unlock(shared);
+            println!("watchdog: recovered ({})", neutralize_name(action));
+        } else {
+            unlock(shared);
         }
-        unlock(shared);
+    }
+}
+
+fn neutralize_name(action: Neutralize) -> &'static str {
+    match action {
+        Neutralize::None => "none",
+        Neutralize::Drop => "drop",
+        Neutralize::DeliverPress { .. } => "deliver-press",
+        Neutralize::DeliverRelease { .. } => "deliver-release",
+        Neutralize::SyntheticClick { .. } => "synthetic-click",
     }
 }
 
@@ -1004,31 +1195,53 @@ fn fuzz_sender(shared: &'static Shared, seconds: u64) {
             .clamp(left.saturating_add(1), right.saturating_sub(2));
         y = (y + ((state >> 16) as i32 % 31) - 15)
             .clamp(top.saturating_add(1), bottom.saturating_sub(2));
-        match roll {
-            0 if !down => {
-                if !fuzz_point_is_ours(shared, x, y) {
-                    shared.fuzz_failed.store(true, Ordering::Release);
-                    break;
-                }
-                crate::inject::inject_plain(EventKind::Press, Button::Right, x, y);
-                down = true;
-            }
-            1 if down => {
-                crate::inject::inject_plain(EventKind::Release, Button::Right, x, y);
-                down = false;
-            }
-            _ => {
-                crate::inject::inject_plain(EventKind::Move, Button::Right, x, y);
-            }
+        let kind = match roll {
+            0 if !down => EventKind::Press,
+            1 if down => EventKind::Release,
+            _ => EventKind::Move,
+        };
+        if !fuzz_point_is_ours(shared, x, y) {
+            shared.fuzz_failed.store(true, Ordering::Release);
+            break;
         }
+        crate::inject::inject_plain(kind, Button::Right, x, y);
+        down = match kind {
+            EventKind::Press => true,
+            EventKind::Release => false,
+            EventKind::Move => down,
+        };
         thread::sleep(Duration::from_millis(8));
     }
-    if down {
+    if down && fuzz_point_is_ours(shared, x, y) {
         crate::inject::inject_plain(EventKind::Release, Button::Right, x, y);
-        thread::sleep(Duration::from_millis(200));
+    }
+    thread::sleep(Duration::from_millis(200));
+    if !shared.stop.load(Ordering::Acquire) {
+        snapshot_fuzz(shared);
     }
     shared.stop.store(true, Ordering::Release);
     signal(shared.stop_event);
+}
+
+fn snapshot_fuzz(shared: &Shared) {
+    let hwnd = HWND(shared.fuzz_hwnd.load(Ordering::Acquire) as *mut std::ffi::c_void);
+    if !hwnd.0.is_null() {
+        unsafe {
+            SendMessageW(hwnd, WM_FUZZ_SAMPLE, Some(WPARAM(0)), Some(LPARAM(0)));
+        }
+    }
+    apply_raw_up_grace(shared);
+    shared
+        .fuzz_snap_phase
+        .store(shared.phase.load(Ordering::Acquire), Ordering::Release);
+    shared
+        .fuzz_snap_delivered
+        .store(shared.delivered.load(Ordering::Acquire), Ordering::Release);
+    shared.fuzz_snap_physical.store(
+        shared.physical_down.load(Ordering::Acquire),
+        Ordering::Release,
+    );
+    shared.fuzz_snap_valid.store(true, Ordering::Release);
 }
 
 fn fuzz_point_is_ours(shared: &Shared, x: i32, y: i32) -> bool {
@@ -1087,6 +1300,9 @@ fn create_fuzz_window(shared: &Shared) -> Result<HWND, SessionError> {
     shared.fuzz_top.store(rect.top, Ordering::Release);
     shared.fuzz_right.store(rect.right, Ordering::Release);
     shared.fuzz_bottom.store(rect.bottom, Ordering::Release);
+    unsafe {
+        let _ = SetForegroundWindow(hwnd);
+    }
     Ok(hwnd)
 }
 
@@ -1096,10 +1312,34 @@ unsafe extern "system" fn fuzz_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    let shared_ptr = SHARED_PTR.load(Ordering::Acquire);
+    if !shared_ptr.is_null() {
+        let shared = &*shared_ptr;
+        match msg {
+            WM_RBUTTONDOWN => {
+                shared.fuzz_downs.fetch_add(1, Ordering::Relaxed);
+            }
+            WM_RBUTTONUP => {
+                shared.fuzz_ups.fetch_add(1, Ordering::Relaxed);
+            }
+            WM_KEYDOWN if wparam.0 as u16 == VK_ESCAPE.0 => {
+                shared.fuzz_failed.store(true, Ordering::Release);
+                shared.stop.store(true, Ordering::Release);
+                signal(shared.stop_event);
+                return LRESULT(0);
+            }
+            WM_FUZZ_SAMPLE => {
+                let down = GetKeyState(i32::from(VK_RBUTTON.0)) < 0;
+                shared.fuzz_key_down.store(down, Ordering::Release);
+                return LRESULT(0);
+            }
+            _ => {}
+        }
+    }
     DefWindowProcW(hwnd, msg, wparam, lparam)
 }
 
-fn install_raw_input() -> Option<HWND> {
+fn install_raw_input() -> Result<HWND, String> {
     let class = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
         lpfnWndProc: Some(raw_proc),
@@ -1109,7 +1349,7 @@ fn install_raw_input() -> Option<HWND> {
     };
     let atom = unsafe { RegisterClassExW(&class) };
     if atom == 0 {
-        return None;
+        return Err("RegisterClassExW failed".to_owned());
     }
     let parent = HWND(-3isize as *mut std::ffi::c_void);
     let hwnd = unsafe {
@@ -1128,22 +1368,22 @@ fn install_raw_input() -> Option<HWND> {
             None,
         )
     }
-    .ok()?;
+    .map_err(|err| format!("CreateWindowExW failed: {err}"))?;
     let devices = [RAWINPUTDEVICE {
         usUsagePage: 0x01,
         usUsage: 0x02,
         dwFlags: RIDEV_INPUTSINK,
         hwndTarget: hwnd,
     }];
-    if unsafe { RegisterRawInputDevices(&devices, std::mem::size_of::<RAWINPUTDEVICE>() as u32) }
-        .is_err()
+    if let Err(err) =
+        unsafe { RegisterRawInputDevices(&devices, std::mem::size_of::<RAWINPUTDEVICE>() as u32) }
     {
         unsafe {
             let _ = DestroyWindow(hwnd);
         }
-        return None;
+        return Err(format!("RegisterRawInputDevices failed: {err}"));
     }
-    Some(hwnd)
+    Ok(hwnd)
 }
 
 unsafe extern "system" fn raw_proc(
@@ -1154,6 +1394,11 @@ unsafe extern "system" fn raw_proc(
 ) -> LRESULT {
     if msg == WM_INPUT {
         note_raw_input(lparam);
+        // RIM_INPUT is foreground raw input and must be passed on for cleanup.
+        let code = (wparam.0 as u32) & 0xff;
+        if code == RIM_INPUT {
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
+        }
         return LRESULT(0);
     }
     DefWindowProcW(hwnd, msg, wparam, lparam)
@@ -1196,11 +1441,22 @@ fn note_raw_input(lparam: LPARAM) {
     }
     let flags = u32::from(unsafe { mouse.Anonymous.Anonymous.usButtonFlags });
     let shared = unsafe { &*shared_ptr };
-    if flags & RI_MOUSE_RIGHT_BUTTON_DOWN != 0 {
+    // RI_MOUSE_RIGHT_* is the physical right button. WM_RBUTTON* follows the
+    // swapped (logical) button, so when SM_SWAPBUTTON is set the logical right
+    // button is the physical left one.
+    let swapped = unsafe { GetSystemMetrics(SM_SWAPBUTTON) } != 0;
+    let (down_flag, up_flag) = if swapped {
+        (RI_MOUSE_LEFT_BUTTON_DOWN, RI_MOUSE_LEFT_BUTTON_UP)
+    } else {
+        (RI_MOUSE_RIGHT_BUTTON_DOWN, RI_MOUSE_RIGHT_BUTTON_UP)
+    };
+    if flags & down_flag != 0 {
+        shared.raw_up_at.store(0, Ordering::Release);
         shared.physical_down.store(true, Ordering::Release);
     }
-    if flags & RI_MOUSE_RIGHT_BUTTON_UP != 0 {
-        shared.physical_down.store(false, Ordering::Release);
+    if flags & up_flag != 0 && shared.raw_up_at.load(Ordering::Acquire) == 0 {
+        let now = qpc().max(1);
+        shared.raw_up_at.store(now, Ordering::Release);
     }
 }
 

@@ -130,10 +130,15 @@ impl CapturePump {
     }
 
     /// Record one hook event. Does not inject or publish; the caller drains later.
+    ///
+    /// Pass-through moves are not queued. Only a command, a replay, or deferred
+    /// other-button events occupy a slot.
     pub fn on_hook(&mut self, event: InputEvent) -> crate::Decision {
         let output = self.machine.handle(event);
         let decision = output.decision;
-        let _ = self.queue.push(output);
+        if output_is_actionable(&output) {
+            let _ = self.queue.push(output);
+        }
         decision
     }
 
@@ -196,19 +201,55 @@ pub trait Injector {
     fn inject(&mut self, output: Output) -> bool;
 }
 
+/// Actionable outputs drained after `peek` returns. Fixed storage, no allocation.
+#[derive(Clone, Copy)]
+pub struct HookBatch {
+    slots: [Output; OUTPUT_QUEUE_CAP],
+    len: usize,
+}
+
+impl HookBatch {
+    fn empty() -> Self {
+        Self {
+            slots: [empty_output(); OUTPUT_QUEUE_CAP],
+            len: 0,
+        }
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[Output] {
+        &self.slots[..self.len]
+    }
+}
+
+fn output_is_actionable(output: &Output) -> bool {
+    output.command != Command::None || output.replay.is_some() || output.deferred_len > 0
+}
+
 /// Commands queued by `peek`, drained only after `peek` has returned.
 ///
 /// Draining inside the `while peek` body drops every command, because a sent
 /// hook call is delivered inside `peek` and `peek` then returns false.
-pub fn poll_hook<M: HookMessages>(msgs: &mut M, pump: &mut CapturePump) -> Vec<Output> {
+pub fn poll_hook<M: HookMessages>(msgs: &mut M, pump: &mut CapturePump) -> HookBatch {
     while msgs.peek(pump) {}
-    let mut outputs = Vec::new();
+    let mut batch = HookBatch::empty();
     while let Some(output) = pump.pop() {
-        if output.command != Command::None || output.replay.is_some() || output.deferred_len > 0 {
-            outputs.push(output);
+        if output_is_actionable(&output) && batch.len < OUTPUT_QUEUE_CAP {
+            batch.slots[batch.len] = output;
+            batch.len += 1;
         }
     }
-    outputs
+    batch
 }
 
 /// [`poll_hook`], then hand each output to `injector`.
@@ -222,9 +263,9 @@ pub fn service_hook<M: HookMessages, I: Injector>(
     injector: &mut I,
 ) {
     let outputs = poll_hook(msgs, pump);
-    for (index, output) in outputs.iter().copied().enumerate() {
+    for (index, output) in outputs.as_slice().iter().copied().enumerate() {
         if !injector.inject(output) {
-            for pending in outputs.iter().copied().skip(index).rev() {
+            for pending in outputs.as_slice().iter().copied().skip(index).rev() {
                 let _ = pump.push_front(pending);
             }
             break;
@@ -389,6 +430,14 @@ mod tests {
             clicks, 1,
             "a click swallowed inside peek must still be re-injected"
         );
+    }
+
+    #[test]
+    fn pass_through_moves_are_not_queued() {
+        let mut pump = CapturePump::new(Config::default());
+        pump.on_hook(event(EventKind::Press, 0, 0, 0));
+        pump.on_hook(event(EventKind::Move, 40, 0, 10));
+        assert_eq!(pump.queue_len(), 0);
     }
 
     #[test]

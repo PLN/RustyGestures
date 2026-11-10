@@ -321,6 +321,12 @@ impl Machine {
         self.deferred_len
     }
 
+    /// Timestamp of the last non-injected event, for stillness checks.
+    #[must_use]
+    pub fn last_event_ms(&self) -> u32 {
+        self.last_event_ms
+    }
+
     #[must_use]
     pub fn swallow_next_release(&self) -> bool {
         self.swallow_next

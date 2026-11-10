@@ -188,7 +188,13 @@ impl GestureFile {
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), GestureIoError> {
     let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, bytes)?;
+    {
+        use std::io::Write;
+        let mut file = fs::File::create(&tmp)?;
+        file.write_all(bytes)?;
+        // WRITE_THROUGH covers the rename, not the bytes already written.
+        file.sync_all()?;
+    }
     replace_file(&tmp, path)?;
     Ok(())
 }

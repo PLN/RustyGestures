@@ -17,7 +17,8 @@ pub use gestures::{
 };
 pub use histogram::{LatencyHistogram, LatencySummary};
 pub use pump::{
-    poll_hook, service_hook, CapturePump, HookMessages, Injector, OutputQueue, OUTPUT_QUEUE_CAP,
+    poll_hook, service_hook, CapturePump, HookBatch, HookMessages, Injector, OutputQueue,
+    OUTPUT_QUEUE_CAP,
 };
 pub use recognizer::{GestureSet, Recognition, RESAMPLE_POINTS};
 pub use ring::{SpscRing, RING_CAP};

@@ -43,6 +43,13 @@ pub(crate) fn inject_release(button: Button, x: i32, y: i32) {
     send(&inputs);
 }
 
+/// Button-up at the cursor. No `MOUSEEVENTF_MOVE` or `ABSOLUTE`, so a recovery
+/// release does not warp back to the press origin.
+pub(crate) fn inject_release_in_place(button: Button) {
+    let inputs = [button_only(up_flag(button), mouse_data(button))];
+    send(&inputs);
+}
+
 pub(crate) fn inject_replay(replay: Replay) {
     let (dx, dy) = absolute(replay.x, replay.y);
     let (flags, data) = match replay.kind {
@@ -82,6 +89,22 @@ fn mouse(dx: i32, dy: i32, flags: MOUSE_EVENT_FLAGS, mouse_data: u32) -> INPUT {
                 dy,
                 mouseData: mouse_data,
                 dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | flags,
+                time: 0,
+                dwExtraInfo: INJECTED_EXTRA_INFO,
+            },
+        },
+    }
+}
+
+fn button_only(flags: MOUSE_EVENT_FLAGS, mouse_data: u32) -> INPUT {
+    INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: 0,
+                dy: 0,
+                mouseData: mouse_data,
+                dwFlags: flags,
                 time: 0,
                 dwExtraInfo: INJECTED_EXTRA_INFO,
             },

@@ -18,7 +18,7 @@ If a button gets stuck, press Ctrl+C in this console (the keyboard is not hooked
 
 ## Capture
 
-From a normal terminal, in the repo:
+From PowerShell, in the repo:
 
 ```text
 Set-Location C:\path\to\RustyGestures
@@ -42,7 +42,7 @@ target\x86_64-pc-windows-msvc\release\rustygestures.exe run --gestures C:\path\t
 | Release over an elevated window | Standard engine. Start a right-button stroke over Explorer, move onto an elevated Windows Terminal, and release there. | The engine returns to idle. The next right click in Explorer works. Nothing stays held down. |
 | Ctrl+Alt+Del mid-stroke | Start a stroke, press Ctrl+Alt+Del, cancel back to the desktop, then right-click. | The stroke is dropped. The next right click works. |
 | UAC mid-stroke | Start a stroke and trigger a UAC prompt. Dismiss it, then right-click. | Same as the row above. |
-| Hold still, then drag | Hold the right button still for 600 ms, then drag across a window. | The target sees the drag. A press the hook swallowed must not be treated as already up. |
+| Hold still, then drag | Hold the right button still for 600 ms, then drag across a window and release. | The target sees the drag. The drop is where the button was released, not back at the press. |
 
 ## Latency
 
@@ -59,11 +59,11 @@ target\x86_64-pc-windows-msvc\release\rustygestures.exe run --gestures C:\path\t
 
 - [ ] Start a stroke and kill the process from Task Manager while the button is still down. The right button is not stuck afterwards.
 - [ ] Repeat with Ctrl+C and by closing the console window.
-- [ ] Watchdog: train a gesture first, then `rustygestures.exe run --debug-stall-ms 400 --gestures C:\path\to\RustyGestures\gestures.json`. Press the right button and hold still while the hook thread sleeps 400 ms once without refreshing its heartbeat (past the 250 ms stall limit). Do not move during that sleep: a stall while the mouse is moving can exceed `LowLevelHooksTimeout` and Windows will remove the hook. The stalled stroke is dropped and no click is injected at the origin. Then draw the trained gesture. Its name is printed. A bare right click afterwards is not enough, because that also works when the hook is gone.
+- [ ] Watchdog: train a gesture first, then `rustygestures.exe run --debug-stall-ms 400 --gestures C:\path\to\RustyGestures\gestures.json`. Start a stroke (move about 20 px), stop moving, and wait for the line `debug stall: sleeping 400 ms`. Holding still without that move stays in Pending, so the stall does not run. Do not move during the sleep: a stall while the mouse is moving can exceed `LowLevelHooksTimeout` and Windows will remove the hook. The console also prints `watchdog: recovered (drop)`. The stalled stroke is dropped and no click is injected at the origin. Then draw the trained gesture. Its name is printed. A bare right click afterwards is not enough, because that also works when the hook is gone.
 
 ## One hour of fuzzed input
 
-This is the M0 "no stuck buttons" soak. Run it in a virtual machine. The tool opens a full-screen window it owns and injects random moves, presses, and releases through `SendInput` only while `WindowFromPoint` reports that window. If the pointer is over something else, the soak aborts.
+This is the M0 "no stuck buttons" soak. Run it in a virtual machine, from PowerShell. The tool opens a full-screen window it owns and injects random moves, presses, and releases through `SendInput` only while `WindowFromPoint` reports that window, and it checks again before every injection. If the pointer is over something else, the soak aborts. The fuzz window takes focus, so Ctrl+C may not reach the console. Press Esc in that window to abort.
 
 ```text
 Set-Location C:\path\to\RustyGestures
@@ -76,7 +76,7 @@ target\x86_64-pc-windows-msvc\release\rustygestures.exe fuzz --seconds 3600 --ge
 
 ## Elevation matrix
 
-Open an elevated Windows Terminal with Run as administrator, `cd` to the repo, and pass the exe path and `--gestures`. That is the elevated engine. A normal terminal, same command, is the standard engine. The elevated target is `wt.exe` started as administrator. The normal target is an Explorer window.
+Open an elevated Windows Terminal with Run as administrator. In PowerShell, `Set-Location` to the repo, and pass the exe path and `--gestures`. That is the elevated engine. A normal PowerShell window, same command, is the standard engine. The elevated target is `wt.exe` started as administrator. The normal target is an Explorer window.
 
 | Engine | Target | Expected | Observed |
 |---|---|---|---|

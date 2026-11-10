@@ -18,6 +18,8 @@ pub struct RunStats {
     pub latency: LatencySummary,
     pub dropped_strokes: u64,
     pub trail_active: bool,
+    /// `false` when raw input could not be registered. Tracking is then hook-only.
+    pub raw_input: bool,
 }
 
 /// Options for one capture session.

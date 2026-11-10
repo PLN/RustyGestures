@@ -7,7 +7,11 @@
 //! The score is the $1 path-distance score on a 0–1 scale (1 is a perfect
 //! overlap). Protractor supplies only the closed-form angle, and that angle is
 //! a gate: if the unclamped optimum is outside ±30°, the template is rejected
-//! even when it is the only one.
+//! even when it is the only one. Thin shapes (shorter side under half the
+//! longer side) are scored on the aspect-preserving cloud, because non-uniform
+//! square scaling scores a clockwise rotation and a counter-clockwise one
+//! differently. Pixel rounding can still push a nominal ±29.9° rotation a
+//! fraction of a degree across the gate in only one direction.
 //!
 //! A template is accepted when its score is at least 0.80 and it leads the
 //! next-best *other* gesture by at least 0.05.
@@ -379,16 +383,36 @@ fn score_pair(
     if theta.abs() > ROTATION_LIMIT_RAD {
         return None;
     }
+    // A tall L (about 200×60) is not flat enough for the 1D rule, but square
+    // scaling still scores +20° and −20° differently. Score those on the
+    // aspect-preserving cloud.
+    let thin = is_thin(template_oriented) || is_thin(candidate_oriented);
+    let template_cloud = if thin { template_oriented } else { template };
+    let candidate_cloud = if thin { candidate_oriented } else { candidate };
     let (sin_t, cos_t) = theta.sin_cos();
     let mut rotated = [Vec2 { x: 0.0, y: 0.0 }; RESAMPLE_POINTS];
     for i in 0..RESAMPLE_POINTS {
-        let c = candidate[i];
+        let c = candidate_cloud[i];
         rotated[i] = Vec2 {
             x: c.x * cos_t - c.y * sin_t,
             y: c.x * sin_t + c.y * cos_t,
         };
     }
-    Some(path_score(template, &rotated))
+    Some(path_score(template_cloud, &rotated))
+}
+
+/// Shorter side under half the longer side. The box is the aspect-preserving cloud.
+fn is_thin(points: &[Vec2; RESAMPLE_POINTS]) -> bool {
+    let Some((min_x, min_y, max_x, max_y)) = bounds(points) else {
+        return false;
+    };
+    let width = (max_x - min_x).max(0.0);
+    let height = (max_y - min_y).max(0.0);
+    let long = width.max(height);
+    if long < 1e-9 {
+        return true;
+    }
+    width.min(height) / long < 0.5
 }
 
 fn path_score(template: &[Vec2; RESAMPLE_POINTS], candidate: &[Vec2; RESAMPLE_POINTS]) -> f64 {
@@ -648,6 +672,22 @@ mod tests {
             set.recognize(&past).is_none(),
             "an L rotated 31° must be rejected"
         );
+    }
+
+    #[test]
+    fn tall_l_scores_both_twenty_degree_rotations() {
+        let mut set = GestureSet::new();
+        let mut shape = line(0, 0, 0, 200);
+        shape.extend(line(0, 200, 60, 200).into_iter().skip(1));
+        set.insert_raw("l", &shape);
+        let negative = set
+            .recognize(&rotate_about_centroid(&shape, -20.0))
+            .expect("−20° tall L");
+        let positive = set
+            .recognize(&rotate_about_centroid(&shape, 20.0))
+            .expect("+20° tall L");
+        assert!(negative.score >= 0.80, "−20° score {}", negative.score);
+        assert!(positive.score >= 0.80, "+20° score {}", positive.score);
     }
 
     #[test]
