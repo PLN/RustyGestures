@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: fmt, clippy, test, release, deny
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # 2026-10-16
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+          targets: x86_64-pc-windows-msvc
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Release build
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Install cargo-deny
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ver = '0.20.2'
+          $name = "cargo-deny-$ver-x86_64-pc-windows-msvc"
+          $url = "https://github.com/EmbarkStudios/cargo-deny/releases/download/$ver/$name.tar.gz"
+          Invoke-WebRequest -Uri $url -OutFile cargo-deny.tar.gz
+          tar -xzf cargo-deny.tar.gz
+          New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\.cargo\bin" | Out-Null
+          Copy-Item -Force "$name\cargo-deny.exe" "$env:USERPROFILE\.cargo\bin\cargo-deny.exe"
+          cargo-deny --version
+
+      - name: cargo-deny
+        run: cargo deny check
