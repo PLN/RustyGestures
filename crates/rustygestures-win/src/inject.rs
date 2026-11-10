@@ -46,8 +46,16 @@ pub(crate) fn inject_release(button: Button, x: i32, y: i32) {
 /// Button-up at the cursor. No `MOUSEEVENTF_MOVE` or `ABSOLUTE`, so a recovery
 /// release does not warp back to the press origin.
 pub(crate) fn inject_release_in_place(button: Button) {
-    let inputs = [button_only(up_flag(button), mouse_data(button))];
-    send(&inputs);
+    let mut input = button_only(up_flag(button), mouse_data(button));
+    input.Anonymous.mi.dwExtraInfo = INJECTED_EXTRA_INFO;
+    send(&[input]);
+}
+
+/// Same in-place up, but not tagged, so the hook treats it as the user's release.
+pub(crate) fn inject_plain_release_in_place(button: Button) {
+    let mut input = button_only(up_flag(button), mouse_data(button));
+    input.Anonymous.mi.dwExtraInfo = 0;
+    send(&[input]);
 }
 
 pub(crate) fn inject_replay(replay: Replay) {
@@ -106,7 +114,7 @@ fn button_only(flags: MOUSE_EVENT_FLAGS, mouse_data: u32) -> INPUT {
                 mouseData: mouse_data,
                 dwFlags: flags,
                 time: 0,
-                dwExtraInfo: INJECTED_EXTRA_INFO,
+                dwExtraInfo: 0,
             },
         },
     }

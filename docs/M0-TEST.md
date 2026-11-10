@@ -43,6 +43,7 @@ target\x86_64-pc-windows-msvc\release\rustygestures.exe run --gestures C:\path\t
 | Ctrl+Alt+Del mid-stroke | Start a stroke, press Ctrl+Alt+Del, cancel back to the desktop, then right-click. | The stroke is dropped. The next right click works. |
 | UAC mid-stroke | Start a stroke and trigger a UAC prompt. Dismiss it, then right-click. | Same as the row above. |
 | Hold still, then drag | Hold the right button still for 600 ms, then drag across a window and release. | The target sees the drag. The drop is where the button was released, not back at the press. |
+| Swapped buttons | In Settings, turn on Mouse → "Swap mouse buttons", then start the engine. The hook's right-button messages are the logical button. Raw input's right-button bits are the physical button, and the engine reads `SM_SWAPBUTTON` once at startup so the two stay paired. Right-click, then do a short right drag. | The logical right button still clicks and starts a drag. Change the setting only while the engine is not running. |
 
 ## Latency
 

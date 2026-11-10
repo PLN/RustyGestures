@@ -58,8 +58,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::inject::{
-    button_from_u8, inject_click, inject_press, inject_release, inject_release_in_place,
-    inject_replay,
+    button_from_u8, inject_click, inject_plain_release_in_place, inject_press, inject_release,
+    inject_release_in_place, inject_replay,
 };
 use crate::overlay::Overlay;
 use crate::{Control, RunOptions, RunStats, SessionError};
@@ -86,18 +86,20 @@ struct Shared {
     injecting: AtomicBool,
     stop: AtomicBool,
     session_change: AtomicBool,
-    /// Right button, from non-injected hook events and raw input. Injected
-    /// events (`dwExtraInfo`) do not change it. A raw "up" is applied only
-    /// after [`RAW_UP_GRACE_MS`] with no matching hook release.
-    physical_down: AtomicBool,
-    /// QPC tick when a raw-input up was seen. Zero means none is pending.
-    raw_up_at: AtomicU64,
+    /// Packed physical button. Bit 63 is down. The low 63 bits are the QPC
+    /// tick of a raw-input up that is waiting out [`RAW_UP_GRACE_MS`], or 0.
+    /// One word so a press cannot be lost between clearing the timer and
+    /// storing the button.
+    tracked: AtomicU64,
+    /// `SM_SWAPBUTTON` at startup. Not read again per raw packet.
+    buttons_swapped: AtomicBool,
     raw_input_ok: AtomicBool,
     raw_input_error: Mutex<String>,
     dropped: AtomicU64,
     hook_status: AtomicU8,
     hook_error: Mutex<String>,
     pending_overflow: AtomicBool,
+    pending_overflow_drops: AtomicU64,
     recovery_gen: AtomicU64,
     adopt_delivered: AtomicBool,
     adopt_swallow: AtomicBool,
@@ -221,14 +223,15 @@ where
         injecting: AtomicBool::new(false),
         stop: AtomicBool::new(false),
         session_change: AtomicBool::new(false),
-        physical_down: AtomicBool::new(false),
-        raw_up_at: AtomicU64::new(0),
+        tracked: AtomicU64::new(0),
+        buttons_swapped: AtomicBool::new(false),
         raw_input_ok: AtomicBool::new(false),
         raw_input_error: Mutex::new(String::new()),
         dropped: AtomicU64::new(0),
         hook_status: AtomicU8::new(HOOK_PENDING),
         hook_error: Mutex::new(String::new()),
         pending_overflow: AtomicBool::new(false),
+        pending_overflow_drops: AtomicU64::new(0),
         recovery_gen: AtomicU64::new(0),
         adopt_delivered: AtomicBool::new(false),
         adopt_swallow: AtomicBool::new(false),
@@ -368,7 +371,12 @@ where
         dropped_strokes: shared.dropped.load(Ordering::Relaxed),
         trail_active,
         raw_input: shared.raw_input_ok.load(Ordering::Acquire),
+        pending_overflow_drops: shared.pending_overflow_drops.load(Ordering::Acquire),
     };
+    let drops = stats.pending_overflow_drops;
+    if drops > 0 {
+        println!("pending queue overflow drops={drops}");
+    }
     if options.fuzz_seconds > 0 {
         let idle = shared.fuzz_snap_phase.load(Ordering::Acquire) == Phase::Idle as u8;
         let delivered = shared.fuzz_snap_delivered.load(Ordering::Acquire);
@@ -378,10 +386,12 @@ where
         let downs = shared.fuzz_downs.load(Ordering::Acquire);
         let ups = shared.fuzz_ups.load(Ordering::Acquire);
         let key_down = shared.fuzz_key_down.load(Ordering::Acquire);
-        if !snapped || !idle || delivered || physical || failed || downs != ups || key_down {
+        if failed || !snapped {
+            return Err(SessionError("fuzz aborted".to_owned()));
+        }
+        if !idle || delivered || physical || downs != ups || key_down {
             return Err(SessionError(format!(
-                "fuzz ended with the engine not idle or the button down (idle={idle} delivered={delivered} physical={physical} confined={} snapped={snapped} downs={downs} ups={ups} key_down={key_down})",
-                !failed
+                "fuzz ended with the engine not idle or the button down (idle={idle} delivered={delivered} physical={physical} downs={downs} ups={ups} key_down={key_down})"
             )));
         }
     }
@@ -428,6 +438,10 @@ fn hook_main(shared: &'static Shared) {
             return;
         }
     }
+    shared.buttons_swapped.store(
+        unsafe { GetSystemMetrics(SM_SWAPBUTTON) } != 0,
+        Ordering::Release,
+    );
     let raw_window = match install_raw_input() {
         Ok(hwnd) => {
             shared.raw_input_ok.store(true, Ordering::Release);
@@ -578,7 +592,7 @@ fn hook_main(shared: &'static Shared) {
         };
         let fifo = unsafe { std::ptr::addr_of_mut!((*ptr).pending) };
         if !pending_push(fifo, PendingInject::Recovery(recovery)) {
-            shared.pending_overflow.store(true, Ordering::Release);
+            note_pending_drop(shared);
         }
         for _ in 0..20 {
             if flush_pending(ptr) {
@@ -664,17 +678,13 @@ fn adopt_pump(local_ptr: *mut HookLocal, pump: *mut CapturePump) {
         (*pump).clear_queue();
     }
     let fifo = unsafe { std::ptr::addr_of_mut!((*local_ptr).pending) };
-    if !pending_push_recovery(fifo, shared, recovery) {
-        shared.pending_overflow.store(true, Ordering::Release);
-    }
+    let _ = pending_push_recovery(fifo, shared, recovery);
     publish_pump(shared, unsafe { &*pump });
 }
 
 fn stash_recovery(local: &mut HookLocal, recovery: Recovery) {
     let fifo = std::ptr::addr_of_mut!(local.pending);
-    if !pending_push_recovery(fifo, local.shared, recovery) {
-        local.shared.pending_overflow.store(true, Ordering::Release);
-    }
+    let _ = pending_push_recovery(fifo, local.shared, recovery);
 }
 
 fn recovery_needs_inject(recovery: &Recovery) -> bool {
@@ -734,9 +744,16 @@ fn pending_push_recovery(fifo: *mut PendingFifo, shared: &Shared, recovery: Reco
     if pending_push(fifo, PendingInject::Recovery(recovery)) {
         true
     } else {
-        shared.pending_overflow.store(true, Ordering::Release);
+        note_pending_drop(shared);
         false
     }
+}
+
+fn note_pending_drop(shared: &Shared) {
+    shared.pending_overflow.store(true, Ordering::Release);
+    shared
+        .pending_overflow_drops
+        .fetch_add(1, Ordering::Relaxed);
 }
 
 fn flush_pending(ptr: *mut HookLocal) -> bool {
@@ -750,12 +767,7 @@ fn flush_pending(ptr: *mut HookLocal) -> bool {
             continue;
         }
         if !pending_push_front(fifo, pending) {
-            unsafe {
-                (*ptr)
-                    .shared
-                    .pending_overflow
-                    .store(true, Ordering::Release);
-            }
+            note_pending_drop(unsafe { (*ptr).shared });
         }
         return false;
     }
@@ -765,12 +777,7 @@ fn store_or_apply(ptr: *mut HookLocal, inject: PendingInject) -> bool {
     let fifo = unsafe { std::ptr::addr_of_mut!((*ptr).pending) };
     if !flush_pending(ptr) {
         if !pending_push(fifo, inject) {
-            unsafe {
-                (*ptr)
-                    .shared
-                    .pending_overflow
-                    .store(true, Ordering::Release);
-            }
+            note_pending_drop(unsafe { (*ptr).shared });
         }
         return false;
     }
@@ -781,12 +788,7 @@ fn store_or_apply(ptr: *mut HookLocal, inject: PendingInject) -> bool {
     } else if pending_push(fifo, inject) {
         false
     } else {
-        unsafe {
-            (*ptr)
-                .shared
-                .pending_overflow
-                .store(true, Ordering::Release);
-        }
+        note_pending_drop(unsafe { (*ptr).shared });
         false
     }
 }
@@ -932,8 +934,23 @@ fn unlock(shared: &Shared) {
     shared.injecting.store(false, Ordering::Release);
 }
 
+const TRACK_DOWN: u64 = 1 << 63;
+
+fn pack_tracked(down: bool, raw_up_at: u64) -> u64 {
+    let tick = raw_up_at & !TRACK_DOWN;
+    if down {
+        tick | TRACK_DOWN
+    } else {
+        tick
+    }
+}
+
+fn unpack_tracked(value: u64) -> (bool, u64) {
+    (value & TRACK_DOWN != 0, value & !TRACK_DOWN)
+}
+
 fn physical_down(shared: &Shared) -> bool {
-    shared.physical_down.load(Ordering::Acquire)
+    unpack_tracked(shared.tracked.load(Ordering::Acquire)).0
 }
 
 fn button_down(shared: &Shared) -> bool {
@@ -941,24 +958,41 @@ fn button_down(shared: &Shared) -> bool {
     physical_down(shared)
 }
 
+fn track_update(shared: &Shared, update: impl Fn(bool, u64) -> (bool, u64)) {
+    loop {
+        let current = shared.tracked.load(Ordering::Acquire);
+        let (down, at) = unpack_tracked(current);
+        let (new_down, new_at) = update(down, at);
+        let next = pack_tracked(new_down, new_at);
+        if shared
+            .tracked
+            .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return;
+        }
+    }
+}
+
 /// A raw-input up waits out the grace period. A hook release in that window
 /// cancels it, so the real release is not replaced by one injected early.
+/// The compare-and-swap includes the down bit, so a press that lands first
+/// is not overwritten.
 fn apply_raw_up_grace(shared: &Shared) {
-    let at = shared.raw_up_at.load(Ordering::Acquire);
-    if at == 0 {
+    let (down, at) = unpack_tracked(shared.tracked.load(Ordering::Acquire));
+    if !down || at == 0 {
         return;
     }
     let age = ticks_to_ms(qpc().saturating_sub(at), shared.qpc_freq);
     if age < RAW_UP_GRACE_MS {
         return;
     }
-    if shared
-        .raw_up_at
-        .compare_exchange(at, 0, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok()
-    {
-        shared.physical_down.store(false, Ordering::Release);
-    }
+    let _ = shared.tracked.compare_exchange(
+        pack_tracked(true, at),
+        pack_tracked(false, 0),
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
 }
 
 fn note_physical(shared: &Shared, event: &InputEvent) {
@@ -966,14 +1000,8 @@ fn note_physical(shared: &Shared, event: &InputEvent) {
         return;
     }
     match event.kind {
-        EventKind::Press => {
-            shared.raw_up_at.store(0, Ordering::Release);
-            shared.physical_down.store(true, Ordering::Release);
-        }
-        EventKind::Release => {
-            shared.raw_up_at.store(0, Ordering::Release);
-            shared.physical_down.store(false, Ordering::Release);
-        }
+        EventKind::Press => track_update(shared, |_, _| (true, 0)),
+        EventKind::Release => track_update(shared, |_, _| (false, 0)),
         EventKind::Move => {}
     }
 }
@@ -1212,8 +1240,10 @@ fn fuzz_sender(shared: &'static Shared, seconds: u64) {
         };
         thread::sleep(Duration::from_millis(8));
     }
-    if down && fuzz_point_is_ours(shared, x, y) {
-        crate::inject::inject_plain(EventKind::Release, Button::Right, x, y);
+    if down {
+        // In-place, and untagged, so a miss still releases the button without
+        // moving the cursor or leaving the tracker down. One up either way.
+        inject_plain_release_in_place(Button::Right);
     }
     thread::sleep(Duration::from_millis(200));
     if !shared.stop.load(Ordering::Acquire) {
@@ -1237,10 +1267,9 @@ fn snapshot_fuzz(shared: &Shared) {
     shared
         .fuzz_snap_delivered
         .store(shared.delivered.load(Ordering::Acquire), Ordering::Release);
-    shared.fuzz_snap_physical.store(
-        shared.physical_down.load(Ordering::Acquire),
-        Ordering::Release,
-    );
+    shared
+        .fuzz_snap_physical
+        .store(physical_down(shared), Ordering::Release);
     shared.fuzz_snap_valid.store(true, Ordering::Release);
 }
 
@@ -1441,23 +1470,31 @@ fn note_raw_input(lparam: LPARAM) {
     }
     let flags = u32::from(unsafe { mouse.Anonymous.Anonymous.usButtonFlags });
     let shared = unsafe { &*shared_ptr };
-    // RI_MOUSE_RIGHT_* is the physical right button. WM_RBUTTON* follows the
-    // swapped (logical) button, so when SM_SWAPBUTTON is set the logical right
-    // button is the physical left one.
-    let swapped = unsafe { GetSystemMetrics(SM_SWAPBUTTON) } != 0;
+    // WH_MOUSE_LL's WM_RBUTTON* is taken to be the logical button after
+    // "Swap mouse buttons". RI_MOUSE_RIGHT_* is the physical right button, so
+    // when the swap is on, the logical right button is RI_MOUSE_LEFT_*.
+    // The setting is read once at startup. Confirm the hook side on Windows.
+    let swapped = shared.buttons_swapped.load(Ordering::Acquire);
     let (down_flag, up_flag) = if swapped {
         (RI_MOUSE_LEFT_BUTTON_DOWN, RI_MOUSE_LEFT_BUTTON_UP)
     } else {
         (RI_MOUSE_RIGHT_BUTTON_DOWN, RI_MOUSE_RIGHT_BUTTON_UP)
     };
-    if flags & down_flag != 0 {
-        shared.raw_up_at.store(0, Ordering::Release);
-        shared.physical_down.store(true, Ordering::Release);
-    }
-    if flags & up_flag != 0 && shared.raw_up_at.load(Ordering::Acquire) == 0 {
-        let now = qpc().max(1);
-        shared.raw_up_at.store(now, Ordering::Release);
-    }
+    let now = qpc().max(1) & !TRACK_DOWN;
+    track_update(shared, |down, at| {
+        let mut down = down;
+        let mut at = at;
+        if flags & down_flag != 0 {
+            down = true;
+            at = 0;
+        }
+        // Arm only while the button is still tracked down. A raw up that
+        // arrives after the hook release must not start another timer.
+        if flags & up_flag != 0 && down && at == 0 {
+            at = now;
+        }
+        (down, at)
+    });
 }
 
 struct SessionWindow {

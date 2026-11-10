@@ -7,11 +7,11 @@
 //! The score is the $1 path-distance score on a 0–1 scale (1 is a perfect
 //! overlap). Protractor supplies only the closed-form angle, and that angle is
 //! a gate: if the unclamped optimum is outside ±30°, the template is rejected
-//! even when it is the only one. Thin shapes (shorter side under half the
-//! longer side) are scored on the aspect-preserving cloud, because non-uniform
-//! square scaling scores a clockwise rotation and a counter-clockwise one
-//! differently. Pixel rounding can still push a nominal ±29.9° rotation a
-//! fraction of a degree across the gate in only one direction.
+//! even when it is the only one. The candidate is rotated by that gate angle
+//! while its aspect is still preserved, and only then square-scaled and scored.
+//! Square-scaling before the rotation stretches a clockwise turn and a
+//! counter-clockwise turn differently. Pixel rounding can still push a nominal
+//! ±29.9° rotation a fraction of a degree across the gate in only one direction.
 //!
 //! A template is accepted when its score is at least 0.80 and it leads the
 //! next-best *other* gesture by at least 0.05.
@@ -373,7 +373,7 @@ fn optimal_angle(template: &[Vec2; RESAMPLE_POINTS], candidate: &[Vec2; RESAMPLE
 
 fn score_pair(
     template: &[Vec2; RESAMPLE_POINTS],
-    candidate: &[Vec2; RESAMPLE_POINTS],
+    _candidate: &[Vec2; RESAMPLE_POINTS],
     template_oriented: &[Vec2; RESAMPLE_POINTS],
     candidate_oriented: &[Vec2; RESAMPLE_POINTS],
 ) -> Option<f64> {
@@ -383,36 +383,20 @@ fn score_pair(
     if theta.abs() > ROTATION_LIMIT_RAD {
         return None;
     }
-    // A tall L (about 200×60) is not flat enough for the 1D rule, but square
-    // scaling still scores +20° and −20° differently. Score those on the
-    // aspect-preserving cloud.
-    let thin = is_thin(template_oriented) || is_thin(candidate_oriented);
-    let template_cloud = if thin { template_oriented } else { template };
-    let candidate_cloud = if thin { candidate_oriented } else { candidate };
+    // Rotate in the aspect-preserving frame, then square-scale. Doing the
+    // square scale first makes +20° and −20° of a tall shape score differently,
+    // and scoring the unscaled cloud makes a line or a mirror look like an L.
     let (sin_t, cos_t) = theta.sin_cos();
     let mut rotated = [Vec2 { x: 0.0, y: 0.0 }; RESAMPLE_POINTS];
     for i in 0..RESAMPLE_POINTS {
-        let c = candidate_cloud[i];
+        let c = candidate_oriented[i];
         rotated[i] = Vec2 {
             x: c.x * cos_t - c.y * sin_t,
             y: c.x * sin_t + c.y * cos_t,
         };
     }
-    Some(path_score(template_cloud, &rotated))
-}
-
-/// Shorter side under half the longer side. The box is the aspect-preserving cloud.
-fn is_thin(points: &[Vec2; RESAMPLE_POINTS]) -> bool {
-    let Some((min_x, min_y, max_x, max_y)) = bounds(points) else {
-        return false;
-    };
-    let width = (max_x - min_x).max(0.0);
-    let height = (max_y - min_y).max(0.0);
-    let long = width.max(height);
-    if long < 1e-9 {
-        return true;
-    }
-    width.min(height) / long < 0.5
+    scale_square(&mut rotated, SQUARE_SIZE);
+    Some(path_score(template, &rotated))
 }
 
 fn path_score(template: &[Vec2; RESAMPLE_POINTS], candidate: &[Vec2; RESAMPLE_POINTS]) -> f64 {
@@ -671,6 +655,62 @@ mod tests {
         assert!(
             set.recognize(&past).is_none(),
             "an L rotated 31° must be rejected"
+        );
+    }
+
+    fn tall_l(stem: i32, foot: i32) -> Vec<Point> {
+        let mut shape = line(0, 0, 0, stem);
+        shape.extend(line(0, stem, foot, stem).into_iter().skip(1));
+        shape
+    }
+
+    #[test]
+    fn tall_l_rejects_a_line_a_mirror_and_a_narrower_foot() {
+        let mut set = GestureSet::new();
+        let shape = tall_l(200, 60);
+        set.insert_raw("l", &shape);
+        assert!(
+            set.recognize(&line(0, 0, 0, 200)).is_none(),
+            "a vertical line is not a tall L"
+        );
+        assert!(
+            set.recognize(&tall_l(200, -60)).is_none(),
+            "a mirrored L is not the trained L"
+        );
+        assert!(
+            set.recognize(&tall_l(200, 20)).is_none(),
+            "a 200×20 L is not the 200×60 template"
+        );
+    }
+
+    #[test]
+    fn narrower_l_matches_down_when_down_is_also_trained() {
+        let mut set = GestureSet::new();
+        set.insert_raw("down", &line(0, 0, 0, 200));
+        set.insert_raw("l", &tall_l(200, 60));
+        let found = set.recognize(&tall_l(200, 20)).expect("200×20 L");
+        assert_eq!(found.name, "down");
+    }
+
+    #[test]
+    fn wider_l_is_symmetric_at_twenty_degrees() {
+        let mut set = GestureSet::new();
+        let shape = tall_l(200, 110);
+        set.insert_raw("l", &shape);
+        let negative = set
+            .recognize(&rotate_about_centroid(&shape, -20.0))
+            .expect("−20° 200×110 L");
+        let positive = set
+            .recognize(&rotate_about_centroid(&shape, 20.0))
+            .expect("+20° 200×110 L");
+        assert!(negative.score >= 0.80, "−20° score {}", negative.score);
+        assert!(positive.score >= 0.80, "+20° score {}", positive.score);
+        let gap = (negative.score - positive.score).abs();
+        assert!(
+            gap < 0.05,
+            "±20° scores {} and {} differ by {gap}",
+            negative.score,
+            positive.score
         );
     }
 

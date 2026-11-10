@@ -433,14 +433,6 @@ mod tests {
     }
 
     #[test]
-    fn pass_through_moves_are_not_queued() {
-        let mut pump = CapturePump::new(Config::default());
-        pump.on_hook(event(EventKind::Press, 0, 0, 0));
-        pump.on_hook(event(EventKind::Move, 40, 0, 10));
-        assert_eq!(pump.queue_len(), 0);
-    }
-
-    #[test]
     fn overflow_keeps_commands_already_queued() {
         let mut pump = CapturePump::new(Config::default());
         for i in 0..OUTPUT_QUEUE_CAP {

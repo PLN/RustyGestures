@@ -20,6 +20,8 @@ pub struct RunStats {
     pub trail_active: bool,
     /// `false` when raw input could not be registered. Tracking is then hook-only.
     pub raw_input: bool,
+    /// Pending-injection FIFO overflows. Each one drops an item `recover` cannot restore.
+    pub pending_overflow_drops: u64,
 }
 
 /// Options for one capture session.
