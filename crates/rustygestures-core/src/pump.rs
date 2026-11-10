@@ -1,10 +1,9 @@
 //! Queue of hook decisions, drained after the message pump returns.
 //!
-//! Windows delivers `WH_MOUSE_LL` inside `PeekMessage` and then returns false
-//! when nothing was posted. The hook thread must apply this queue after every
-//! pump, not only when `PeekMessage` returns true. The queue is a fixed array
-//! so the callback stays allocation-free. It is only touched on the hook thread,
-//! including when `SendInput` re-enters the callback.
+//! A low-level hook call can run inside `PeekMessage` and that call can then
+//! return false because nothing was posted. Drain only after `peek` returns.
+//! Re-entry on the same thread is possible, so callers must not hold `&mut`
+//! across `SendInput`. The queue is a fixed array and does not allocate.
 
 use crate::{Command, Config, InputEvent, Machine, Output, CAPTURE_INACTIVITY_MS};
 
@@ -143,14 +142,24 @@ impl CapturePump {
         self.queue.len()
     }
 
-    /// `true` when a push was dropped. Cleared by [`Self::drain`] once observed.
+    /// `true` when a new output was refused. Commands already queued stay.
     #[must_use]
     pub fn take_overflow(&mut self) -> bool {
         let overflow = self.queue.overflowed();
-        if overflow {
-            self.queue.clear();
-        }
+        self.queue.overflow = false;
         overflow
+    }
+
+    /// Put an output back at the head when injection has to wait.
+    pub fn push_front(&mut self, output: Output) -> bool {
+        if self.queue.len == OUTPUT_QUEUE_CAP {
+            self.queue.overflow = true;
+            return false;
+        }
+        self.queue.head = (self.queue.head + OUTPUT_QUEUE_CAP - 1) % OUTPUT_QUEUE_CAP;
+        self.queue.slots[self.queue.head] = output;
+        self.queue.len += 1;
+        true
     }
 
     #[must_use]
@@ -167,9 +176,59 @@ impl CapturePump {
         self.machine.poll_timeout(now_ms, physically_down)
     }
 
-    pub fn poll_inactivity(&mut self, now_ms: u32) -> crate::Neutralize {
+    pub fn poll_inactivity(&mut self, now_ms: u32) -> crate::Recovery {
         let _ = CAPTURE_INACTIVITY_MS;
         self.machine.poll_inactivity(now_ms)
+    }
+}
+
+/// A source of hook deliveries.
+///
+/// `peek` may call `pump.on_hook` for a sent low-level-hook call and then
+/// return false, which is what `PeekMessage` does when nothing was posted.
+pub trait HookMessages {
+    fn peek(&mut self, pump: &mut CapturePump) -> bool;
+}
+
+/// Applies one drained [`Output`]. `false` means the caller must try this
+/// output again after pumping messages; it was not applied.
+pub trait Injector {
+    fn inject(&mut self, output: Output) -> bool;
+}
+
+/// Commands queued by `peek`, drained only after `peek` has returned.
+///
+/// Draining inside the `while peek` body drops every command, because a sent
+/// hook call is delivered inside `peek` and `peek` then returns false.
+pub fn poll_hook<M: HookMessages>(msgs: &mut M, pump: &mut CapturePump) -> Vec<Output> {
+    while msgs.peek(pump) {}
+    let mut outputs = Vec::new();
+    while let Some(output) = pump.pop() {
+        if output.command != Command::None || output.replay.is_some() || output.deferred_len > 0 {
+            outputs.push(output);
+        }
+    }
+    outputs
+}
+
+/// [`poll_hook`], then hand each output to `injector`.
+///
+/// The injector does not run inside `peek`. A caller that injects with
+/// `SendInput` must use [`poll_hook`] and inject only after that returns, so
+/// no `&mut` is held across the call.
+pub fn service_hook<M: HookMessages, I: Injector>(
+    msgs: &mut M,
+    pump: &mut CapturePump,
+    injector: &mut I,
+) {
+    let outputs = poll_hook(msgs, pump);
+    for (index, output) in outputs.iter().copied().enumerate() {
+        if !injector.inject(output) {
+            for pending in outputs.iter().copied().skip(index).rev() {
+                let _ = pump.push_front(pending);
+            }
+            break;
+        }
     }
 }
 
@@ -275,5 +334,77 @@ mod tests {
         }));
         assert!(queue.overflowed());
         assert_eq!(queue.len(), OUTPUT_QUEUE_CAP);
+    }
+
+    struct SentThenFalse {
+        events: std::collections::VecDeque<InputEvent>,
+    }
+
+    impl HookMessages for SentThenFalse {
+        fn peek(&mut self, pump: &mut CapturePump) -> bool {
+            if let Some(event) = self.events.pop_front() {
+                let _ = pump.on_hook(event);
+            }
+            // A sent hook call is delivered inside peek, then peek returns false.
+            false
+        }
+    }
+
+    struct Record {
+        outputs: Vec<Output>,
+    }
+
+    impl Injector for Record {
+        fn inject(&mut self, output: Output) -> bool {
+            self.outputs.push(output);
+            true
+        }
+    }
+
+    #[test]
+    fn sent_hook_call_is_applied_when_peek_returns_false() {
+        let mut source = SentThenFalse {
+            events: [
+                event(EventKind::Press, 10, 20, 0),
+                event(EventKind::Release, 10, 20, 30),
+            ]
+            .into(),
+        };
+        let mut pump = CapturePump::new(Config::default());
+        let mut injector = Record {
+            outputs: Vec::new(),
+        };
+        for _ in 0..4 {
+            service_hook(&mut source, &mut pump, &mut injector);
+            if source.events.is_empty() && pump.queue_len() == 0 {
+                break;
+            }
+        }
+        let clicks = injector
+            .outputs
+            .iter()
+            .filter(|output| matches!(output.command, Command::ReinjectClick { .. }))
+            .count();
+        assert_eq!(
+            clicks, 1,
+            "a click swallowed inside peek must still be re-injected"
+        );
+    }
+
+    #[test]
+    fn overflow_keeps_commands_already_queued() {
+        let mut pump = CapturePump::new(Config::default());
+        for i in 0..OUTPUT_QUEUE_CAP {
+            pump.on_hook(event(EventKind::Press, i as i32, 0, i as u32));
+            pump.on_hook(event(EventKind::Release, i as i32, 0, i as u32 + 1));
+        }
+        let refused = pump.on_hook(event(EventKind::Press, 9, 9, 10_000));
+        let _ = pump.on_hook(event(EventKind::Release, 9, 9, 10_001));
+        let _ = refused;
+        assert!(pump.take_overflow());
+        assert!(
+            pump.pop().is_some(),
+            "a full queue must keep the commands it already accepted"
+        );
     }
 }

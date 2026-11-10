@@ -36,7 +36,12 @@ struct Vec2 {
 
 #[derive(Clone, Debug)]
 struct Sample {
+    /// Square-scaled cloud used for the $1 path-distance score.
     points: [Vec2; RESAMPLE_POINTS],
+    /// Aspect-preserving cloud. The ±30° gate is measured here, before the
+    /// non-uniform square scale, so a rotated shape is not accepted just
+    /// because that scale changed its best angle.
+    oriented: [Vec2; RESAMPLE_POINTS],
 }
 
 #[derive(Clone, Debug)]
@@ -82,12 +87,19 @@ impl GestureSet {
         let Some(prepared) = preprocess(points) else {
             return false;
         };
+        let Some(oriented) = oriented_cloud(points) else {
+            return false;
+        };
+        let sample = Sample {
+            points: prepared,
+            oriented,
+        };
         if let Some(gesture) = self.gestures.iter_mut().find(|g| g.name == name) {
-            gesture.samples.push(Sample { points: prepared });
+            gesture.samples.push(sample);
         } else {
             self.gestures.push(Gesture {
                 name: name.to_owned(),
-                samples: vec![Sample { points: prepared }],
+                samples: vec![sample],
             });
         }
         true
@@ -97,13 +109,16 @@ impl GestureSet {
     #[must_use]
     pub fn recognize(&self, points: &[Point]) -> Option<Recognition> {
         let candidate = preprocess(points)?;
+        let oriented = oriented_cloud(points)?;
         let mut best_name: Option<&str> = None;
         let mut best = f64::NEG_INFINITY;
         let mut second = f64::NEG_INFINITY;
         for gesture in &self.gestures {
             let mut gesture_score = f64::NEG_INFINITY;
             for sample in &gesture.samples {
-                let Some(score) = score_pair(&sample.points, &candidate) else {
+                let Some(score) =
+                    score_pair(&sample.points, &candidate, &sample.oriented, &oriented)
+                else {
                     continue;
                 };
                 if score > gesture_score {
@@ -312,21 +327,55 @@ fn bounds(points: &[Vec2]) -> Option<(f64, f64, f64, f64)> {
 ///
 /// `None` means the best rotation is outside ±30°, so the template does not
 /// match this orientation.
-fn score_pair(
-    template: &[Vec2; RESAMPLE_POINTS],
-    candidate: &[Vec2; RESAMPLE_POINTS],
-) -> Option<f64> {
+fn oriented_cloud(points: &[Point]) -> Option<[Vec2; RESAMPLE_POINTS]> {
+    if points.len() < 2 {
+        return None;
+    }
+    let raw: Vec<Vec2> = points
+        .iter()
+        .map(|point| Vec2 {
+            x: f64::from(point.x),
+            y: f64::from(point.y),
+        })
+        .collect();
+    let mut resampled = resample(&raw, RESAMPLE_POINTS)?;
+    translate_to_centroid(&mut resampled);
+    let path = path_length(&resampled);
+    if path < 1e-6 {
+        return None;
+    }
+    let scale = SQUARE_SIZE / path;
+    for point in &mut resampled {
+        point.x *= scale;
+        point.y *= scale;
+    }
+    let mut out = [Vec2 { x: 0.0, y: 0.0 }; RESAMPLE_POINTS];
+    out.copy_from_slice(&resampled);
+    Some(out)
+}
+
+fn optimal_angle(template: &[Vec2; RESAMPLE_POINTS], candidate: &[Vec2; RESAMPLE_POINTS]) -> f64 {
     let mut a = 0.0;
     let mut b = 0.0;
     for i in 0..RESAMPLE_POINTS {
         let t = template[i];
         let c = candidate[i];
         a += t.x * c.x + t.y * c.y;
-        // Dot product after rotating the candidate by θ is `a cos θ + b sin θ`
-        // with this `b`. The maximizing θ is `atan2(b, a)`.
+        // Dot product after rotating the candidate by θ is `a cos θ + b sin θ`.
         b += t.y * c.x - t.x * c.y;
     }
-    let theta = b.atan2(a);
+    b.atan2(a)
+}
+
+fn score_pair(
+    template: &[Vec2; RESAMPLE_POINTS],
+    candidate: &[Vec2; RESAMPLE_POINTS],
+    template_oriented: &[Vec2; RESAMPLE_POINTS],
+    candidate_oriented: &[Vec2; RESAMPLE_POINTS],
+) -> Option<f64> {
+    // Gate on the aspect-preserving clouds. Non-uniform square scaling can
+    // shrink the apparent angle of a rotated shape below the limit.
+    let theta = optimal_angle(template_oriented, candidate_oriented);
     if theta.abs() > ROTATION_LIMIT_RAD {
         return None;
     }
@@ -358,6 +407,24 @@ fn path_score(template: &[Vec2; RESAMPLE_POINTS], candidate: &[Vec2; RESAMPLE_PO
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rotate_about_centroid(points: &[Point], degrees: f64) -> Vec<Point> {
+        let (sin_t, cos_t) = degrees.to_radians().sin_cos();
+        let n = points.len() as f64;
+        let cx = points.iter().map(|point| f64::from(point.x)).sum::<f64>() / n;
+        let cy = points.iter().map(|point| f64::from(point.y)).sum::<f64>() / n;
+        points
+            .iter()
+            .map(|point| {
+                let x = f64::from(point.x) - cx;
+                let y = f64::from(point.y) - cy;
+                Point {
+                    x: (cx + x * cos_t - y * sin_t).round() as i32,
+                    y: (cy + x * sin_t + y * cos_t).round() as i32,
+                }
+            })
+            .collect()
+    }
 
     fn line(x0: i32, y0: i32, x1: i32, y1: i32) -> Vec<Point> {
         let steps = 24;
@@ -565,6 +632,22 @@ mod tests {
         assert!(near.score >= 0.90, "20° score {}", near.score);
         assert!(set.recognize(&ray(45.0, 160.0)).is_none());
         assert!(set.recognize(&ray(60.0, 160.0)).is_none());
+    }
+
+    #[test]
+    fn rotated_l_past_thirty_degrees_is_rejected() {
+        let mut set = GestureSet::new();
+        let shape = l_down_right(100, 0, 0);
+        set.insert_raw("l", &shape);
+        let turned = rotate_about_centroid(&shape, 20.0);
+        let near = set.recognize(&turned).expect("20° L");
+        assert_eq!(near.name, "l");
+        assert!(near.score >= 0.80, "20° L score {}", near.score);
+        let past = rotate_about_centroid(&shape, 31.0);
+        assert!(
+            set.recognize(&past).is_none(),
+            "an L rotated 31° must be rejected"
+        );
     }
 
     #[test]

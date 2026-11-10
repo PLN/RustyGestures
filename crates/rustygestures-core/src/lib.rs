@@ -16,12 +16,14 @@ pub use gestures::{
     GestureName, NamedGesture, RawPoint, RawStroke, StrokeLog, GESTURE_SCHEMA,
 };
 pub use histogram::{LatencyHistogram, LatencySummary};
-pub use pump::{CapturePump, OutputQueue, OUTPUT_QUEUE_CAP};
+pub use pump::{
+    poll_hook, service_hook, CapturePump, HookMessages, Injector, OutputQueue, OUTPUT_QUEUE_CAP,
+};
 pub use recognizer::{GestureSet, Recognition, RESAMPLE_POINTS};
 pub use ring::{SpscRing, RING_CAP};
 pub use state::{
     is_injected_extra, is_touch_or_pen_extra, Button, Command, Config, Decision, EventKind,
-    InputEvent, Machine, Neutralize, Output, Phase, Point, RecoverKind, Replay, Stroke,
+    InputEvent, Machine, Neutralize, Output, Phase, Point, RecoverKind, Recovery, Replay, Stroke,
     CAPTURE_INACTIVITY_MS, DEFAULT_CANCEL_DELAY_MS, DEFAULT_MIN_MOVE_PX, DEFERRED_CAP,
     INJECTED_EXTRA_INFO, MAX_STROKE_POINTS, TOUCH_PEN_EXTRA_MASK, TOUCH_PEN_EXTRA_SIGNATURE,
     WATCHDOG_STALL_MS,

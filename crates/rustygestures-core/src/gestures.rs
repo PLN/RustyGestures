@@ -208,10 +208,17 @@ fn replace_file(from: &Path, to: &Path) -> Result<(), GestureIoError> {
         extern "system" {
             fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
         }
-        // MOVEFILE_REPLACE_EXISTING. The destination name switches to the
-        // completed temp file in one call, so a crash cannot leave a missing file.
+        // REPLACE_EXISTING swaps the name in one call. WRITE_THROUGH asks the
+        // filesystem to flush the directory entry before MoveFileExW returns.
         const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
-        let ok = unsafe { MoveFileExW(from_w.as_ptr(), to_w.as_ptr(), MOVEFILE_REPLACE_EXISTING) };
+        const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+        let ok = unsafe {
+            MoveFileExW(
+                from_w.as_ptr(),
+                to_w.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
         if ok == 0 {
             return Err(io::Error::last_os_error().into());
         }

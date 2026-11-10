@@ -587,7 +587,7 @@ fn device_removed(err: &windows::core::Error) -> bool {
 
 fn device_removed_hr(hr: windows::core::HRESULT) -> bool {
     let code = hr.0 as u32;
-    code == 0x887A_0005 || code == 0x887A_0007
+    code == 0x887A_0005 || code == 0x887A_0007 || code == 0x8899_000C
 }
 
 fn local_points(points: &[(i32, i32)], origin: POINT) -> Vec<(f32, f32)> {

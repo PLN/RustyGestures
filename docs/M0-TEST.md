@@ -21,7 +21,7 @@ If a button gets stuck, press Ctrl+C in this console (the keyboard is not hooked
 From a normal terminal, in the repo:
 
 ```text
-cd /d C:\path\to\RustyGestures
+Set-Location C:\path\to\RustyGestures
 target\x86_64-pc-windows-msvc\release\rustygestures.exe run --gestures C:\path\to\RustyGestures\gestures.json
 ```
 
@@ -42,6 +42,7 @@ target\x86_64-pc-windows-msvc\release\rustygestures.exe run --gestures C:\path\t
 | Release over an elevated window | Standard engine. Start a right-button stroke over Explorer, move onto an elevated Windows Terminal, and release there. | The engine returns to idle. The next right click in Explorer works. Nothing stays held down. |
 | Ctrl+Alt+Del mid-stroke | Start a stroke, press Ctrl+Alt+Del, cancel back to the desktop, then right-click. | The stroke is dropped. The next right click works. |
 | UAC mid-stroke | Start a stroke and trigger a UAC prompt. Dismiss it, then right-click. | Same as the row above. |
+| Hold still, then drag | Hold the right button still for 600 ms, then drag across a window. | The target sees the drag. A press the hook swallowed must not be treated as already up. |
 
 ## Latency
 
@@ -58,18 +59,18 @@ target\x86_64-pc-windows-msvc\release\rustygestures.exe run --gestures C:\path\t
 
 - [ ] Start a stroke and kill the process from Task Manager while the button is still down. The right button is not stuck afterwards.
 - [ ] Repeat with Ctrl+C and by closing the console window.
-- [ ] Watchdog: `rustygestures.exe run --debug-stall-ms 400 --gestures C:\path\to\RustyGestures\gestures.json`. Draw one stroke. The hook thread sleeps 400 ms once without refreshing its heartbeat, which is past the 250 ms stall limit. The stroke is dropped, no click is injected at the origin, and the next right click works.
+- [ ] Watchdog: train a gesture first, then `rustygestures.exe run --debug-stall-ms 400 --gestures C:\path\to\RustyGestures\gestures.json`. Press the right button and hold still while the hook thread sleeps 400 ms once without refreshing its heartbeat (past the 250 ms stall limit). Do not move during that sleep: a stall while the mouse is moving can exceed `LowLevelHooksTimeout` and Windows will remove the hook. The stalled stroke is dropped and no click is injected at the origin. Then draw the trained gesture. Its name is printed. A bare right click afterwards is not enough, because that also works when the hook is gone.
 
 ## One hour of fuzzed input
 
-This is the M0 "no stuck buttons" soak. It injects random moves, presses, and releases through `SendInput` while the hook is installed.
+This is the M0 "no stuck buttons" soak. Run it in a virtual machine. The tool opens a full-screen window it owns and injects random moves, presses, and releases through `SendInput` only while `WindowFromPoint` reports that window. If the pointer is over something else, the soak aborts.
 
 ```text
-cd /d C:\path\to\RustyGestures
+Set-Location C:\path\to\RustyGestures
 target\x86_64-pc-windows-msvc\release\rustygestures.exe fuzz --seconds 3600 --gestures C:\path\to\RustyGestures\gestures.json
 ```
 
-- [ ] It runs for an hour and prints `fuzz finished` and a latency line.
+- [ ] It runs for an hour and prints `fuzz finished` and a latency line. If the engine is not idle, the button is still down, or the pointer left the tool window, the process exits non-zero and does not print `fuzz finished`.
 - [ ] Afterwards a normal right click and a normal drag both work. No button is stuck.
 - [ ] Repeat on the other of Win10 and Win11 if both are available. Record each machine below.
 
@@ -87,7 +88,7 @@ Open an elevated Windows Terminal with Run as administrator, `cd` to the repo, a
 Elevated engine, from the admin terminal:
 
 ```text
-cd /d C:\path\to\RustyGestures
+Set-Location C:\path\to\RustyGestures
 target\x86_64-pc-windows-msvc\release\rustygestures.exe run --gestures C:\path\to\RustyGestures\gestures.json
 ```
 

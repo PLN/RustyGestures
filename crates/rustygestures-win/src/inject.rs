@@ -139,17 +139,3 @@ fn norm(value: i32, origin: i32, span: i32) -> i32 {
     };
     rounded.clamp(0, 65535) as i32
 }
-
-pub(crate) fn button_is_down(button: Button) -> bool {
-    use windows::Win32::UI::Input::KeyboardAndMouse::{
-        GetAsyncKeyState, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON, VK_XBUTTON1, VK_XBUTTON2,
-    };
-    let vk = match button {
-        Button::Left => VK_LBUTTON,
-        Button::Right => VK_RBUTTON,
-        Button::Middle => VK_MBUTTON,
-        Button::X1 => VK_XBUTTON1,
-        Button::X2 => VK_XBUTTON2,
-    };
-    (unsafe { GetAsyncKeyState(i32::from(vk.0)) } as u16) & 0x8000 != 0
-}
